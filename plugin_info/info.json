@@ -1,7 +1,7 @@
 {
     "id": "ajaxsiabe",
     "name": "Ajax SIA",
-    "pluginVersion": "0.1",
+    "pluginVersion": "0.2",
     "description": {
         "fr_FR": "Réception locale des événements d'une alarme Ajax par le protocole SIA DC-09 des centres de télésurveillance, sans cloud ni dépendance : Jeedom tient le rôle du centre de télésurveillance. Armement, désarmement et mode nuit avec le nom de l'utilisateur, alarmes (intrusion, incendie, inondation, panique…), sabotages, coupures secteur, batteries faibles, pertes de liaison et brouillage. Messages chiffrés AES pris en charge. Le hub et ses appareils sont créés tout seuls au premier message, chaque trame reçue est gardée dans un journal consultable, et la liaison avec le hub est surveillée en continu."
     },

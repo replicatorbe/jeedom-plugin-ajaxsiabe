@@ -15,8 +15,6 @@ foreach ($eqLogics as $eqLogic) {
 		$hubs[] = $eqLogic;
 	}
 }
-$port = (int) config::byKey('port', 'ajaxsiabe', 7777);
-$internalAddr = config::byKey('internalAddr', 'core', '');
 ?>
 
 <div class="row row-overflow">
@@ -48,20 +46,38 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 			<i class="fas fa-circle-notch fa-spin"></i> {{Interrogation du récepteur…}}
 		</div>
 
-		<?php
-		if (count($hubs) == 0) {
-			echo '<div class="alert alert-warning" style="margin:5px;">';
-			echo '<b>{{Aucun hub pour le moment. Pour le raccorder :}}</b>';
-			echo '<ol style="margin:5px 0 0 0;padding-left:20px;">';
-			echo '<li>{{Dans l\'application Ajax PRO : Hub → Paramètres → Centre de télésurveillance.}}</li>';
-			echo '<li>{{Protocole}} <b>SIA DC-09 (SIA-DCS)</b>, {{adresse IP}} <b>' . htmlspecialchars($internalAddr != '' ? $internalAddr : '{{celle de Jeedom}}') . '</b>, {{port}} <b>' . $port . '</b>.</li>';
-			echo '<li>{{Un numéro d\'objet (le compte, 3 à 16 caractères hexadécimaux) et une clé de chiffrement, que vous reportez dans la configuration du plugin. Avec une clé, Jeedom refuse tout message en clair : personne ne peut lui faire croire à un désarmement.}}</li>';
-			echo '<li>{{Un intervalle de test court (1 à 5 minutes) : c\'est lui qui permet à Jeedom de voir tomber la liaison.}}</li>';
-			echo '<li>{{Le hub apparaît ici dès son premier message (rechargez la page), et chaque appareil au premier événement qui le concerne. Si « Créer les hubs inconnus » est décoché dans la configuration, créez le hub à la main avec son numéro de compte.}}</li>';
-			echo '</ol>';
-			echo '</div>';
-		}
-		?>
+		<!--
+			Assistant de raccordement : tout ce qu'il faut recopier dans Ajax PRO,
+			avec un bouton de copie par valeur. Déplié tant qu'aucun hub n'existe.
+			Les valeurs sont remplies par desktop/js/ajaxsiabe.js (action
+			« connection ») : la clé ne transite donc jamais par le HTML de la page.
+		-->
+		<div class="panel panel-default" id="div_ajaxsiabeConnect" style="margin:5px;">
+			<div class="panel-heading cursor" id="bt_ajaxsiabeConnectToggle">
+				<h3 class="panel-title"><i class="fas fa-plug"></i> {{Raccorder un hub}} <i class="fas fa-chevron-down pull-right"></i></h3>
+			</div>
+			<div class="panel-body" id="div_ajaxsiabeConnectBody" data-open="<?php echo (count($hubs) == 0) ? '1' : '0'; ?>" style="display:none;">
+				<p>{{Dans l'application Ajax PRO : Hub → Paramètres → Centre de télésurveillance. Recopiez ces valeurs :}}</p>
+				<table class="table table-condensed" style="max-width:720px;">
+					<tbody>
+						<tr><td>{{Protocole}}</td><td><b>SIA DC-09 (SIA-DCS)</b></td><td></td></tr>
+						<tr><td>{{Adresse IP}}</td><td><b class="ajaxsiabeConnectValue" data-field="ip"></b></td><td><a class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="ip"><i class="fas fa-copy"></i></a></td></tr>
+						<tr><td>{{Port}}</td><td><b class="ajaxsiabeConnectValue" data-field="port"></b> <small class="text-muted">(TCP)</small></td><td><a class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="port"><i class="fas fa-copy"></i></a></td></tr>
+						<tr><td>{{Numéro d'objet}}</td><td><b class="ajaxsiabeConnectValue" data-field="account"></b> <small class="text-muted">{{(proposé : libre, vous pouvez en choisir un autre de 3 à 16 caractères hexadécimaux)}}</small></td><td><a class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="account"><i class="fas fa-copy"></i></a></td></tr>
+						<tr>
+							<td>{{Clé de chiffrement}}</td>
+							<td>
+								<b class="ajaxsiabeConnectValue" data-field="key" style="font-family:monospace;"></b>
+								<a class="btn btn-xs btn-warning" id="bt_ajaxsiabeGenerateKey"><i class="fas fa-key"></i> <span></span></a>
+							</td>
+							<td><a class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="key"><i class="fas fa-copy"></i></a></td>
+						</tr>
+						<tr><td>{{Intervalle de test (ping)}}</td><td><b>1 {{min}}</b> <small class="text-muted">{{(1 à 5 min : c'est lui qui permet de voir tomber la liaison)}}</small></td><td></td></tr>
+					</tbody>
+				</table>
+				<p class="text-muted" style="margin:0;">{{Le hub apparaît ici dès son premier message (rechargez la page), et chaque appareil au premier événement qui le concerne. Ouvrez le Journal SIA en suivi direct pour voir arriver les messages. Si « Créer les hubs inconnus » est décoché dans la configuration, créez le hub à la main avec son numéro de compte.}}</p>
+			</div>
+		</div>
 
 		<div class="input-group" style="margin:5px;">
 			<input class="form-control roundedLeft" placeholder="{{Rechercher}}" id="in_searchEqlogic">

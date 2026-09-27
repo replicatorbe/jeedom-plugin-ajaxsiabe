@@ -17,6 +17,8 @@ Documentation : [docs/fr_FR/index.md](docs/fr_FR/index.md)
 ## Développement
 
 - `php tests/test_codec.php` : jeu d'essai du codec SIA, sans Jeedom ni réseau.
+- `php tests/test_daemon.php` : essai de bout en bout du démon contre un faux
+  callback, sur des ports libres (quelques secondes).
 - `php tools/sia-send.php --demo` : simulateur de hub, qui envoie une séquence
   d'événements au récepteur. `--help` pour les options.
 

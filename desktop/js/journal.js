@@ -184,14 +184,100 @@ function ajaxsiabeJournalRender(_result) {
     pre.style.margin = '0'
     pre.textContent = ajaxsiabeJournalDetail(entry)
     cell.appendChild(pre)
+    ajaxsiabeJournalNameButtons(cell, entry)
     detail.appendChild(cell)
     detail.style.display = open[key] ? '' : 'none'
     tbody.appendChild(detail)
   })
 }
 
+/* Boutons « Nommer la zone N » et « Nommer l'utilisateur N » sous le détail :
+   on nomme au moment même où l'on voit arriver l'événement de son geste. */
+function ajaxsiabeJournalNameButtons(_cell, _entry) {
+  if (!_entry.hubId) {
+    return
+  }
+  var seen = {}
+  var bar = document.createElement('div')
+  bar.style.marginTop = '5px'
+  var events = _entry.events || []
+  events.forEach(function (e) {
+    var targets = []
+    if (e.zoneNumber > 0) {
+      targets.push({ kind: 'zone', number: e.zoneNumber, current: e.zoneName || '', label: '{{Nommer la zone}} ' + e.zoneNumber })
+    }
+    if (e.userNumber !== null && e.userNumber !== undefined && e.userNumber > 0) {
+      targets.push({ kind: 'user', number: e.userNumber, current: e.userName || '', label: '{{Nommer l\'utilisateur}} ' + e.userNumber })
+    }
+    targets.forEach(function (t) {
+      var key = t.kind + t.number
+      if (seen[key]) {
+        return
+      }
+      seen[key] = true
+      var button = document.createElement('a')
+      button.className = 'btn btn-xs btn-default bt_ajaxsiabeName'
+      button.style.marginRight = '5px'
+      button.setAttribute('data-kind', t.kind)
+      button.setAttribute('data-number', t.number)
+      button.setAttribute('data-hub', _entry.hubId)
+      button.setAttribute('data-current', t.current)
+      var icon = document.createElement('i')
+      icon.className = (t.kind === 'zone') ? 'fas fa-door-open' : 'fas fa-user'
+      button.appendChild(icon)
+      button.appendChild(document.createTextNode(' ' + t.label + (t.current ? ' (' + t.current + ')' : '')))
+      bar.appendChild(button)
+    })
+  })
+  if (bar.childNodes.length > 0) {
+    _cell.appendChild(bar)
+  }
+}
+
+function ajaxsiabeJournalName(_button) {
+  var kind = _button.getAttribute('data-kind')
+  var number = _button.getAttribute('data-number')
+  var current = _button.getAttribute('data-current') || ''
+  /* Un nom par défaut (« Zone 12 », « utilisateur 5 ») n'est pas proposé
+     comme valeur de départ. */
+  var isDefault = new RegExp('^(zone|utilisateur) [0-9]+$', 'i').test(current)
+  jeeDialog.prompt({
+    title: (kind === 'zone' ? '{{Nom de l\'appareil}} ' : '{{Nom de l\'utilisateur}} ') + number,
+    value: isDefault ? '' : current,
+    callback: function (result) {
+      if (result === null || String(result).trim() === '') {
+        return
+      }
+      domUtils.ajax({
+        type: 'POST',
+        url: 'plugins/ajaxsiabe/core/ajax/ajaxsiabe.ajax.php',
+        data: { action: (kind === 'zone') ? 'nameZone' : 'nameUser', hub_id: _button.getAttribute('data-hub'), number: number, name: String(result).trim() },
+        dataType: 'json',
+        global: false,
+        noDisplayError: true,
+        error: function (request, status, error) {
+          domUtils.handleAjaxError(request, status, error)
+        },
+        success: function (data) {
+          if (data.state != 'ok') {
+            jeedomUtils.showAlert({ message: data.result, level: 'danger' })
+            return
+          }
+          jeedomUtils.showAlert({ message: '{{Nom enregistré : il s\'applique aussi aux événements passés.}}', level: 'success' })
+          ajaxsiabeJournalLoad(true)
+        }
+      })
+    }
+  })
+}
+
 /* Un seul écouteur pour toutes les lignes : ouvre ou ferme le détail. */
 function ajaxsiabeJournalToggle(event) {
+  var name = event.target.closest('.bt_ajaxsiabeName')
+  if (name !== null) {
+    ajaxsiabeJournalName(name)
+    return
+  }
   var row = event.target.closest('#table_ajaxsiabeJournal tbody tr')
   if (row === null || row.classList.contains('ajaxsiabeDetail')) {
     return

@@ -50,6 +50,44 @@ try {
         ));
     }
 
+    /* Hub du plugin, avec contrôle de type : byId() chargerait n'importe quel
+     * équipement de Jeedom. */
+    $getHub = function ($_id) {
+        $hub = ajaxsiabe::byId($_id);
+        if (!is_object($hub) || $hub->getEqType_name() != 'ajaxsiabe' || $hub->getConfiguration('type') != ajaxsiabe::TYPE_HUB) {
+            throw new Exception(__('Hub introuvable', __FILE__));
+        }
+        return $hub;
+    };
+
+    /* Ce qu'il faut recopier dans Ajax PRO. */
+    if (init('action') == 'connection') {
+        ajax::success(array(
+            'ip'      => config::byKey('internalAddr', 'core', ''),
+            'port'    => (int) config::byKey('port', 'ajaxsiabe', 7777),
+            'udp'     => (int) config::byKey('udp', 'ajaxsiabe', 0),
+            'account' => ajaxsiabe::proposeAccount(),
+            'key'     => ajaxsiabe::generalKey(),
+        ));
+    }
+
+    /* Nouvelle clé générale, enregistrée aussitôt (chiffrée par le coeur). */
+    if (init('action') == 'generateKey') {
+        $key = ajaxsiabe::generateKey();
+        config::save('key', $key, 'ajaxsiabe');
+        ajax::success(array('key' => $key));
+    }
+
+    if (init('action') == 'nameZone') {
+        $zone = $getHub(init('hub_id'))->nameZone(init('number'), init('name'));
+        ajax::success(array('id' => $zone->getId(), 'name' => $zone->getName()));
+    }
+
+    if (init('action') == 'nameUser') {
+        $getHub(init('hub_id'))->nameNumber('users', init('number'), init('name'));
+        ajax::success();
+    }
+
     if (init('action') == 'journalDates') {
         ajax::success(ajaxsiabe::journalDates());
     }

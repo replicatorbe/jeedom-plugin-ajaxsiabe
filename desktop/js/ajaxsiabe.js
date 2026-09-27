@@ -212,6 +212,85 @@ function printEqLogic(_eqLogic) {
   ajaxsiabeShowSupervision(_eqLogic)
 }
 
+/* Copie dans le presse-papiers. navigator.clipboard n'existe qu'en HTTPS ou
+   sur localhost : sinon, repli sur une zone de texte temporaire. */
+function ajaxsiabeCopy(_text) {
+  var done = function () {
+    jeedomUtils.showAlert({ message: '{{Copié :}} ' + _text, level: 'success' })
+  }
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(_text).then(done)
+    return
+  }
+  var area = document.createElement('textarea')
+  area.value = _text
+  area.style.position = 'fixed'
+  area.style.opacity = '0'
+  document.body.appendChild(area)
+  area.select()
+  try {
+    document.execCommand('copy')
+    done()
+  } catch {
+    jeedomUtils.showAlert({ message: '{{Copie impossible, sélectionnez la valeur à la main.}}', level: 'warning' })
+  }
+  document.body.removeChild(area)
+}
+
+/* Assistant de raccordement : valeurs à recopier dans Ajax PRO. */
+var ajaxsiabeConnection = {}
+
+function ajaxsiabeLoadConnection() {
+  if (document.getElementById('div_ajaxsiabeConnect') === null) {
+    return
+  }
+  ajaxsiabeAjax('connection', {}, function (result) {
+    ajaxsiabeConnection = result
+    if (!result.ip) {
+      ajaxsiabeConnection.ip = '{{à régler dans Réglages → Système → Configuration → Réseaux}}'
+    }
+    ajaxsiabeShowConnection()
+  })
+}
+
+function ajaxsiabeShowConnection() {
+  document.querySelectorAll('.ajaxsiabeConnectValue').forEach(function (el) {
+    var field = el.getAttribute('data-field')
+    var value = ajaxsiabeConnection[field]
+    el.textContent = (value === undefined || value === '') ? '{{aucune}}' : String(value)
+  })
+  var button = document.getElementById('bt_ajaxsiabeGenerateKey')
+  if (button !== null) {
+    button.querySelector('span').textContent = ajaxsiabeConnection.key ? '{{Remplacer}}' : '{{Générer une clé}}'
+  }
+  var copyKey = document.querySelector('.bt_ajaxsiabeCopy[data-field="key"]')
+  if (copyKey !== null) {
+    copyKey.style.display = ajaxsiabeConnection.key ? '' : 'none'
+  }
+}
+
+function ajaxsiabeGenerateKey() {
+  var go = function () {
+    ajaxsiabeAjax('generateKey', {}, function (result) {
+      ajaxsiabeConnection.key = result.key
+      ajaxsiabeShowConnection()
+      jeedomUtils.showAlert({ message: '{{Clé enregistrée dans la configuration du plugin. Saisissez-la dans Ajax PRO et activez le chiffrement.}}', level: 'success' })
+    }, function (_message) {
+      jeedomUtils.showAlert({ message: _message, level: 'danger' })
+    })
+  }
+  /* Une clé change tout : dès qu'elle existe, les messages en clair sont
+     refusés, et remplacer l'ancienne coupe les hubs qui l'utilisent. */
+  var message = ajaxsiabeConnection.key
+    ? '{{Remplacer la clé ? Les hubs qui utilisent l\'ancienne ne seront plus acceptés tant que la nouvelle n\'est pas saisie dans Ajax PRO.}}'
+    : '{{Générer une clé ? Dès qu\'elle existe, tout message en clair est refusé : activez le chiffrement dans Ajax PRO avec cette clé, sinon le hub ne sera plus entendu.}}'
+  jeeDialog.confirm(message, function (result) {
+    if (result) {
+      go()
+    }
+  })
+}
+
 /* Les pages sont chargées en AJAX : DOMContentLoaded a déjà eu lieu, les
    écouteurs sont posés à la racine du script. */
 var ajaxsiabeContainer = document.getElementById('div_pageContainer') || document.body
@@ -220,6 +299,30 @@ ajaxsiabeContainer.addEventListener('change', function (event) {
     ajaxsiabeToggleType()
   }
 })
+ajaxsiabeContainer.addEventListener('click', function (event) {
+  var copy = event.target.closest('.bt_ajaxsiabeCopy')
+  if (copy !== null) {
+    var value = ajaxsiabeConnection[copy.getAttribute('data-field')]
+    if (value !== undefined && value !== '') {
+      ajaxsiabeCopy(String(value))
+    }
+    return
+  }
+  if (event.target.closest('#bt_ajaxsiabeGenerateKey')) {
+    ajaxsiabeGenerateKey()
+    return
+  }
+  if (event.target.closest('#bt_ajaxsiabeConnectToggle')) {
+    var body = document.getElementById('div_ajaxsiabeConnectBody')
+    body.style.display = (body.style.display === 'none') ? '' : 'none'
+  }
+})
+
+var ajaxsiabeConnectBody = document.getElementById('div_ajaxsiabeConnectBody')
+if (ajaxsiabeConnectBody !== null && ajaxsiabeConnectBody.getAttribute('data-open') === '1') {
+  ajaxsiabeConnectBody.style.display = ''
+}
+ajaxsiabeLoadConnection()
 
 if (window.ajaxsiabeStatusTimer) {
   clearInterval(window.ajaxsiabeStatusTimer)

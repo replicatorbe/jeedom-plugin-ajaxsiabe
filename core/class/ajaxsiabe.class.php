@@ -65,6 +65,11 @@ class ajaxsiabe extends eqLogic {
         array('logicalId' => 'alarm',        'name' => 'Alarme',                 'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'ALARM_STATE', 'invert' => 1, 'initial' => 0, 'repeat' => 1),
         array('logicalId' => 'alarm_type',   'name' => 'Type d\'alarme',         'type' => 'info',   'subType' => 'string'),
         array('logicalId' => 'alarm_zone',   'name' => 'Origine de l\'alarme',   'type' => 'info',   'subType' => 'string'),
+        array('logicalId' => 'alarm_intrusion', 'name' => 'Alarme intrusion',    'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
+        array('logicalId' => 'alarm_fire',   'name' => 'Alarme incendie',        'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'SMOKE', 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
+        array('logicalId' => 'alarm_water',  'name' => 'Alarme inondation',      'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'FLOOD', 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
+        array('logicalId' => 'alarm_gas',    'name' => 'Alarme gaz',             'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
+        array('logicalId' => 'alarm_panic',  'name' => 'Alarme panique',         'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
         array('logicalId' => 'reset_alarm',  'name' => 'Acquitter l\'alarme',    'type' => 'action', 'subType' => 'other'),
         array('logicalId' => 'tamper',       'name' => 'Sabotage',               'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'SABOTAGE', 'invert' => 1, 'initial' => 0),
         array('logicalId' => 'power',        'name' => 'Secteur',                'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'initial' => 1),
@@ -72,8 +77,24 @@ class ajaxsiabe extends eqLogic {
         array('logicalId' => 'jamming',      'name' => 'Brouillage',             'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0),
         array('logicalId' => 'link',         'name' => 'Liaison',                'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1),
         array('logicalId' => 'last_contact', 'name' => 'Dernier contact',        'type' => 'info',   'subType' => 'string'),
+        array('logicalId' => 'last_user',    'name' => 'Dernier utilisateur',    'type' => 'info',   'subType' => 'string', 'isVisible' => 0),
+        array('logicalId' => 'last_zone',    'name' => 'Dernière zone',          'type' => 'info',   'subType' => 'string', 'isVisible' => 0),
+        array('logicalId' => 'last_category', 'name' => 'Catégorie du dernier événement', 'type' => 'info', 'subType' => 'string', 'repeat' => 1, 'isVisible' => 0),
         array('logicalId' => 'last_event',   'name' => 'Dernier événement',      'type' => 'info',   'subType' => 'string', 'repeat' => 1),
         array('logicalId' => 'last_code',    'name' => 'Dernier code SIA',       'type' => 'info',   'subType' => 'string', 'repeat' => 1, 'isVisible' => 0),
+    );
+
+    /*
+     * Une commande binaire par famille d'alarme : un scénario « incendie →
+     * couper la VMC » se déclenche sur elle, sans comparer de texte. Elles
+     * suivent les alarmes en cours, mémoire d'intrusion comprise.
+     */
+    public static $_alarmFamilies = array(
+        'alarm_intrusion' => array('Intrusion'),
+        'alarm_fire'      => array('Incendie', 'Chaleur', 'Sprinkler'),
+        'alarm_water'     => array('Inondation', 'Gel'),
+        'alarm_gas'       => array('Gaz'),
+        'alarm_panic'     => array('Panique', 'Agression', 'Contrainte', 'Médicale', 'Urgence'),
     );
 
     public static $_zoneCommands = array(
@@ -643,6 +664,7 @@ class ajaxsiabe extends eqLogic {
         $link = $this->getCmd('info', 'link');
         if (is_object($link) && $link->execCmd() !== '' && (int) $link->execCmd() === 0 && $previous > 0) {
             log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . __('liaison rétablie', __FILE__));
+            message::removeAll(__CLASS__, 'linkLost' . $id);
         }
         $this->updateIfChanged('link', 1);
     }
@@ -681,6 +703,7 @@ class ajaxsiabe extends eqLogic {
             $state['alarms'][$zoneNumber] = array('type' => $type, 'latch' => $latch ? 1 : 0);
             $this->checkAndUpdateCmd('alarm_type', $type);
             $this->checkAndUpdateCmd('alarm_zone', ($zoneNumber > 0) ? $this->zoneName($zoneNumber) : $this->getName());
+            $this->publishAlarms($state);
             $this->checkAndUpdateCmd('alarm', 1);
             if (is_object($zone)) {
                 $zone->checkAndUpdateCmd('alarm', 1);
@@ -740,6 +763,13 @@ class ajaxsiabe extends eqLogic {
         }
 
         $this->saveState($state);
+        /* Le contexte d'abord, l'événement ensuite : un scénario déclenché par
+         * « Dernier événement » doit lire l'utilisateur et la zone de celui-ci,
+         * pas ceux du précédent. */
+        $this->checkAndUpdateCmd('last_user', ($subject['user'] !== null) ? $subject['who'] : '');
+        $this->checkAndUpdateCmd('last_zone', ($zoneNumber > 0) ? $this->zoneName($zoneNumber) : '');
+        $categories = AjaxSiaCodec::dictionary('categories');
+        $this->checkAndUpdateCmd('last_category', isset($categories[$info['c']]) ? __($categories[$info['c']], __FILE__) : $info['c']);
         $this->checkAndUpdateCmd('last_code', $code);
         $this->checkAndUpdateCmd('last_event', $label);
         if (is_object($zone)) {
@@ -843,6 +873,19 @@ class ajaxsiabe extends eqLogic {
     /* Commandes d'alarme du hub d'après ce qui reste en cours : la dernière
      * alarme encore active donne le type et l'origine. */
     private function publishAlarms($_state) {
+        $active = array();
+        foreach ($_state['alarms'] as $alarm) {
+            $active[$alarm['type']] = true;
+        }
+        foreach (self::$_alarmFamilies as $logicalId => $types) {
+            $on = 0;
+            foreach ($types as $type) {
+                if (isset($active[__($type, __FILE__)])) {
+                    $on = 1;
+                }
+            }
+            $this->updateIfChanged($logicalId, $on);
+        }
         if (empty($_state['alarms'])) {
             $this->updateIfChanged('alarm', 0);
             $this->updateIfChanged('alarm_type', '');
@@ -903,10 +946,12 @@ class ajaxsiabe extends eqLogic {
 
     public static function cron() {
         /* Démon arrêté : c'est le récepteur qui est sourd, pas le hub qui s'est
-         * tu. Accuser le hub déclencherait de fausses alertes. */
+         * tu. Accuser le hub déclencherait de fausses alertes. Le coeur relance
+         * lui-même un démon arrêté quand la gestion automatique est active. */
         if (self::deamon_info()['state'] != 'ok') {
             return;
         }
+        self::checkListening();
         $daemonStart = (int) cache::byKey('ajaxsiabe::daemonStart')->getValue(0);
         foreach (self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_HUB), true) as $hub) {
             try {
@@ -926,11 +971,197 @@ class ajaxsiabe extends eqLogic {
                     log::add(__CLASS__, 'warning', $hub->getHumanName() . ' ' . __('muet depuis', __FILE__) . ' '
                            . round((time() - $last) / 60) . ' min : ' . __('liaison déclarée perdue', __FILE__));
                     $hub->checkAndUpdateCmd('link', 0);
+                    /* Une alerte visible sans scénario : un hub muet, c'est une
+                     * alarme qui ne préviendrait plus personne. */
+                    message::add(__CLASS__, $hub->getHumanName() . ' ' . __('ne donne plus de nouvelles depuis', __FILE__) . ' '
+                               . round((time() - $last) / 60) . ' min. '
+                               . __('Vérifiez son alimentation et sa connexion réseau.', __FILE__), '', 'linkLost' . $hub->getId());
                 }
             } catch (Throwable $e) {
                 log::add(__CLASS__, 'error', __('Supervision en échec :', __FILE__) . ' ' . $e->getMessage());
             }
         }
+    }
+
+    /*
+     * Démon vivant mais sourd (port pris, refusé) : aucun message n'arrive, et
+     * rien d'autre ne le signalerait. Un message tant que dure le problème.
+     */
+    private static function checkListening() {
+        $status = self::daemonStatus();
+        if (!is_array($status)) {
+            return;
+        }
+        if (empty($status['tcp']) || (int) $status['tcp'] !== (int) $status['port']) {
+            if (!cache::byKey('ajaxsiabe::deafNotified')->getValue(0)) {
+                message::add(__CLASS__, __('Le récepteur SIA n\'écoute pas sur le port', __FILE__) . ' ' . $status['port'] . ' : '
+                           . (!empty($status['listenError']) ? $status['listenError'] : __('raison inconnue', __FILE__))
+                           . '. ' . __('Les messages du hub ne peuvent pas arriver.', __FILE__), '', 'deaf');
+                cache::set('ajaxsiabe::deafNotified', 1);
+            }
+        } elseif (cache::byKey('ajaxsiabe::deafNotified')->getValue(0)) {
+            message::removeAll(__CLASS__, 'deaf');
+            cache::set('ajaxsiabe::deafNotified', 0);
+        }
+    }
+
+    /* ============================================================ SANTÉ */
+
+    /* Page Santé de Jeedom : réception, chiffrement, et chaque hub. */
+    public static function health() {
+        $return = array();
+        $daemon = self::deamon_info();
+        $status = ($daemon['state'] == 'ok') ? self::daemonStatus() : null;
+        $port = (int) config::byKey('port', __CLASS__, 7777);
+
+        $listening = is_array($status) && !empty($status['tcp']) && (int) $status['tcp'] === $port;
+        $return[] = array(
+            'test'   => __('Réception SIA', __FILE__),
+            'result' => $listening
+                ? __('à l\'écoute sur le port', __FILE__) . ' ' . $port . ' (' . (!empty($status['udp']) ? 'TCP + UDP' : 'TCP') . ')'
+                : (($daemon['state'] != 'ok') ? __('démon arrêté', __FILE__)
+                    : __('port', __FILE__) . ' ' . $port . ' ' . __('non ouvert', __FILE__)
+                      . (is_array($status) && !empty($status['listenError']) ? ' : ' . $status['listenError'] : '')),
+            'advice' => __('Le hub envoie ses messages sur ce port : sans lui, rien n arrive.', __FILE__),
+            'state'  => $listening,
+        );
+        if (is_array($status)) {
+            $return[] = array(
+                'test'   => __('Trames reçues', __FILE__),
+                'result' => $status['frames'] . ' ' . __('depuis le démarrage du démon, dont', __FILE__) . ' ' . $status['rejected'] . ' ' . __('refusée(s)', __FILE__),
+                'advice' => __('Le journal SIA donne le motif de chaque refus.', __FILE__),
+                'state'  => true,
+            );
+        }
+
+        $hubs = self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_HUB), true);
+        $unencrypted = array();
+        foreach ($hubs as $hub) {
+            if ($hub->hubKey() === '' && self::generalKey() === '') {
+                $unencrypted[] = $hub->getName();
+            }
+        }
+        $return[] = array(
+            'test'   => __('Chiffrement', __FILE__),
+            'result' => empty($unencrypted) ? ((self::generalKey() !== '' || count($hubs) > 0) ? __('actif', __FILE__) : __('aucun hub', __FILE__))
+                                            : __('absent pour', __FILE__) . ' ' . implode(', ', $unencrypted),
+            'advice' => __('Sans clé, n importe quel appareil du réseau peut envoyer un faux désarmement.', __FILE__),
+            'state'  => empty($unencrypted),
+        );
+
+        foreach ($hubs as $hub) {
+            $last = (int) cache::byKey('ajaxsiabe::contact::' . $hub->getId())->getValue(0);
+            $delay = $hub->supervisionDelay();
+            $link = $hub->getCmd('info', 'link');
+            $ok = $last > 0 && (!is_object($link) || (string) $link->execCmd() !== '0');
+            $result = ($last > 0) ? __('dernier message il y a', __FILE__) . ' ' . self::duration(time() - $last) : __('aucun message reçu', __FILE__);
+            $result .= ' — ' . __('supervision', __FILE__) . ' : ' . (($delay > 0) ? self::duration($delay) : __('pas encore mesurée', __FILE__));
+            $return[] = array(
+                'test'   => $hub->getName(),
+                'result' => $result,
+                'advice' => __('Le hub doit envoyer des tests de liaison réguliers (intervalle de test dans Ajax PRO).', __FILE__),
+                'state'  => $ok,
+            );
+        }
+        return $return;
+    }
+
+    /* « 1 h 30 min », « 4 min », « 12 s ». */
+    public static function duration($_seconds) {
+        $s = max(0, (int) $_seconds);
+        if ($s < 60) {
+            return $s . ' s';
+        }
+        if ($s < 3600) {
+            return floor($s / 60) . ' min';
+        }
+        if ($s < 86400) {
+            $minutes = floor(($s % 3600) / 60);
+            return floor($s / 3600) . ' h' . ($minutes > 0 ? ' ' . $minutes . ' min' : '');
+        }
+        return floor($s / 86400) . ' j';
+    }
+
+    /* ==================================================== RACCORDEMENT */
+
+    /* Clé aléatoire de 16 caractères hexadécimaux, la forme qu'acceptent les
+     * applications Ajax (AES-128). */
+    public static function generateKey() {
+        return strtoupper(bin2hex(random_bytes(8)));
+    }
+
+    /* Un numéro de compte libre à proposer pour un nouveau hub. */
+    public static function proposeAccount() {
+        $taken = array();
+        foreach (self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_HUB)) as $hub) {
+            $taken[strtoupper((string) $hub->getConfiguration('account'))] = true;
+        }
+        do {
+            $account = strtoupper(bin2hex(random_bytes(2)));
+        } while (isset($taken[$account]));
+        return $account;
+    }
+
+    /* Nomme l'appareil N d'un hub, en le créant s'il n'existe pas encore. */
+    public function nameZone($_number, $_name) {
+        $number = (int) $_number;
+        $name = trim((string) $_name);
+        if ($number < 1 || $number > self::ZONE_MAX) {
+            throw new Exception(__('Numéro de zone invalide', __FILE__));
+        }
+        if ($name === '') {
+            throw new Exception(__('Le nom ne peut pas être vide', __FILE__));
+        }
+        $zone = $this->zone($number);
+        if (!is_object($zone)) {
+            $zone = new ajaxsiabe();
+            $zone->setEqType_name(__CLASS__);
+            $zone->setObject_id($this->getObject_id());
+            $zone->setConfiguration('type', self::TYPE_ZONE);
+            $zone->setConfiguration('hub_id', $this->getId());
+            $zone->setConfiguration('zone', $number);
+            $zone->setIsEnable(1);
+            $zone->setIsVisible(1);
+        }
+        foreach (eqLogic::byObjectId(($zone->getObject_id() === '' || $zone->getObject_id() === null) ? null : $zone->getObject_id(), false) as $other) {
+            if ($other->getId() != $zone->getId() && mb_strtolower($other->getName()) === mb_strtolower($name)) {
+                throw new Exception(__('Un équipement porte déjà ce nom sous le même objet :', __FILE__) . ' ' . $other->getHumanName());
+            }
+        }
+        $zone->setName($name);
+        $zone->save();
+        return $zone;
+    }
+
+    /* Nomme l'utilisateur N (ou le groupe N) dans la fiche du hub. */
+    public function nameNumber($_key, $_number, $_name) {
+        if (!in_array($_key, array('users', 'groups'))) {
+            throw new Exception(__('Liste inconnue', __FILE__));
+        }
+        $number = (int) $_number;
+        $name = trim(str_replace(array("\r", "\n", '='), ' ', (string) $_name));
+        if ($number < 0 || $name === '') {
+            throw new Exception(__('Numéro ou nom invalide', __FILE__));
+        }
+        $lines = array();
+        $done = false;
+        foreach (preg_split('/\r?\n/', (string) $this->getConfiguration($_key)) as $line) {
+            if (preg_match('/^\s*0*(\d+)\s*[=:]/', $line, $m) && (int) $m[1] === $number) {
+                if (!$done) {
+                    $lines[] = $number . '=' . $name;
+                    $done = true;
+                }
+                continue;
+            }
+            if (trim($line) !== '') {
+                $lines[] = $line;
+            }
+        }
+        if (!$done) {
+            $lines[] = $number . '=' . $name;
+        }
+        $this->setConfiguration($_key, implode("\n", $lines));
+        $this->save();
     }
 
     /* =========================================================== JOURNAL */
@@ -1005,9 +1236,18 @@ class ajaxsiabe extends eqLogic {
             $hub = ($entry['account'] !== '' && isset($hubs[$entry['account']])) ? $hubs[$entry['account']] : null;
             $entry['hub'] = is_object($hub) ? $hub->getName() : '';
             $texts = array();
-            foreach ($entry['events'] as $event) {
+            foreach ($entry['events'] as $index => $event) {
                 $texts[] = is_object($hub) ? $hub->describeEvent($event) : (isset($event['label']) ? $event['label'] : $event['code']);
+                /* Ce que l'événement désigne, pour les boutons « Nommer » du détail. */
+                if (is_object($hub)) {
+                    $subject = $hub->eventSubject($event);
+                    $entry['events'][$index]['zoneNumber'] = $subject['zone'];
+                    $entry['events'][$index]['zoneName'] = ($subject['zone'] > 0 && is_object($hub->zone($subject['zone']))) ? $hub->zone($subject['zone'])->getName() : '';
+                    $entry['events'][$index]['userNumber'] = $subject['user'];
+                    $entry['events'][$index]['userName'] = ($subject['user'] !== null) ? $subject['who'] : '';
+                }
             }
+            $entry['hubId'] = is_object($hub) ? (int) $hub->getId() : 0;
             if ($entry['type'] == 'NULL') {
                 $texts[] = __('Test de liaison', __FILE__);
             }

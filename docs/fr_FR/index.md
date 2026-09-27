@@ -39,7 +39,12 @@ l'adresse privée de Jeedom. La supervision de la liaison le signale.
    n'en ont pas besoin). Si vous activez le chiffrement côté Ajax, saisissez
    la même **clé de chiffrement** : dès lors, tout message en clair est
    refusé.
-3. Dans l'application **Ajax PRO** (gratuite), ouvrez Hub → Paramètres →
+3. Sur la page du plugin, le panneau **Raccorder un hub** donne tout ce qu'il
+   faut recopier, avec un bouton de copie par valeur : adresse IP, port, un
+   numéro d'objet libre, et la clé. Le bouton **Générer une clé** en crée une
+   et l'enregistre aussitôt dans la configuration du plugin.
+
+   Dans l'application **Ajax PRO** (gratuite), ouvrez Hub → Paramètres →
    **Centre de télésurveillance** et réglez :
    - Protocole : **SIA DC-09 (SIA-DCS)**. Contact ID (ADM-CID) est aussi pris
      en charge ;
@@ -81,6 +86,7 @@ le créer à la main avant de configurer Ajax.
 | Alarme | 1 tant qu'une alarme est en cours. Chaque nouvelle alarme redéclenche les scénarios, même si une autre était déjà en cours. |
 | Type d'alarme | Intrusion, Incendie, Inondation, Gaz, Panique… |
 | Origine de l'alarme | Nom de la zone qui a déclenché. |
+| Alarme intrusion, incendie, inondation, gaz, panique | Une commande binaire par famille, masquée par défaut : 1 tant qu'une alarme de cette famille est en cours. Incendie couvre aussi la chaleur et le sprinkler, inondation le gel, panique l'agression, la contrainte, l'urgence et le médical. |
 | Acquitter l'alarme | Remet l'alarme à zéro côté Jeedom. |
 | Sabotage | 1 tant qu'au moins un sabotage est en cours. |
 | Secteur | 0 pendant une coupure de courant. |
@@ -88,6 +94,9 @@ le créer à la main avant de configurer Ajax.
 | Brouillage | 1 pendant un brouillage radio. |
 | Liaison | 0 quand le hub se tait au-delà du délai de supervision. |
 | Dernier contact | Date du dernier message reçu, test de liaison compris. |
+| Dernier utilisateur | Nom de l'utilisateur du dernier événement, vide s'il n'en concerne aucun. Masquée par défaut. |
+| Dernière zone | Nom de l'appareil du dernier événement, vide s'il n'en concerne aucun. Masquée par défaut. |
+| Catégorie du dernier événement | Alarme, Armement, Sabotage, Panne, Alimentation, Batterie, Liaison, Test, Accès, Système ou Information. Masquée par défaut. |
 | Dernier événement | L'événement en toutes lettres, par exemple « Armement par Jérôme ». |
 | Dernier code SIA | Le code brut, par exemple `CL`. |
 
@@ -108,9 +117,23 @@ le créer à la main avant de configurer Ajax.
 - Quand plusieurs alarmes sont en cours, « Type d'alarme » et « Origine de
   l'alarme » montrent la plus récente encore active.
 
-**Nouvel événement.** « Dernier événement » et « Dernier code SIA »
-déclenchent les scénarios même quand la valeur ne change pas. Deux armements
-de suite par la même personne sont donc bien deux déclenchements.
+**Nouvel événement.** « Dernier événement », « Dernier code SIA » et
+« Catégorie du dernier événement » déclenchent les scénarios même quand la
+valeur ne change pas. Deux armements de suite par la même personne sont donc
+bien deux déclenchements. « Dernier utilisateur » et « Dernière zone » sont
+mis à jour juste avant : un scénario déclenché par le dernier événement lit
+les siens.
+
+Exemples :
+
+- incendie : déclencheur `#[Maison][Hub Ajax][Alarme incendie]# == 1` ;
+- arrivée de Jérôme : déclencheur `#[Maison][Hub Ajax][Dernier événement]#`,
+  condition `#[Maison][Hub Ajax][Dernier utilisateur]# == "Jérôme"` et
+  `#[Maison][Hub Ajax][Mode]# == "Désarmé"`.
+
+**Messages.** Un hub qui se tait au-delà du délai de supervision fait
+apparaître un message dans le centre de messages de Jeedom, retiré dès qu'il
+se manifeste. De même si le récepteur ne parvient pas à ouvrir son port.
 
 ### Zone (appareil)
 
@@ -142,7 +165,10 @@ hub envoie :
 - faites un geste sur le système : armer, désarmer, ouvrir une porte armée,
   ouvrir un boîtier ;
 - la ligne apparaît. Cliquez dessus pour voir la trame brute, son contenu
-  déchiffré, l'écart d'horloge du hub et la réponse envoyée.
+  déchiffré, l'écart d'horloge du hub et la réponse envoyée ;
+- sous le détail, **Nommer la zone N** et **Nommer l'utilisateur N** donnent
+  leur nom à l'appareil ou à la personne du geste que vous venez de faire. Le
+  nom s'applique aussi aux événements passés.
 
 Motifs de refus :
 
@@ -155,6 +181,13 @@ Motifs de refus :
 | CRC faux, Illisible | Trame abîmée ou qui n'est pas du SIA DC-09. Une connexion qui en envoie cinq de suite est fermée. Une longueur annoncée fausse avec un CRC juste est acceptée et signalée par une icône. |
 | Refusé | Adresse absente de la liste des adresses autorisées. |
 | Doublon | Message réémis par le hub. Il reçoit un accusé de réception mais n'est traité qu'une fois. |
+
+## Santé
+
+La page Santé de Jeedom indique pour le plugin : le port réellement ouvert,
+le nombre de trames reçues et refusées, si le chiffrement est actif pour
+chaque hub, et pour chaque hub son dernier message et son délai de
+supervision.
 
 ## Idées de scénarios
 
