@@ -1,0 +1,30 @@
+{
+    "id": "ajaxsiabe",
+    "name": "Ajax SIA",
+    "pluginVersion": "0.1",
+    "description": {
+        "fr_FR": "Réception locale des événements d'une alarme Ajax par le protocole SIA DC-09 des centres de télésurveillance, sans cloud ni dépendance : Jeedom tient le rôle du centre de télésurveillance. Armement, désarmement et mode nuit avec le nom de l'utilisateur, alarmes (intrusion, incendie, inondation, panique…), sabotages, coupures secteur, batteries faibles, pertes de liaison et brouillage. Messages chiffrés AES pris en charge. Le hub et ses appareils sont créés tout seuls au premier message, chaque trame reçue est gardée dans un journal consultable, et la liaison avec le hub est surveillée en continu."
+    },
+    "licence": "AGPL",
+    "author": "sMug (Jérôme Fafchamps)",
+    "require": "4.4",
+    "requireOsVersion": "11",
+    "category": "security",
+    "index": "ajaxsiabe",
+    "hasDependency": 0,
+    "hasOwnDeamon": 1,
+    "maxDependancyInstallTime": 5,
+    "eventjs": 0,
+    "issue": "https://github.com/replicatorbe/jeedom-plugin-ajaxsiabe/issues",
+    "documentation": "https://github.com/replicatorbe/jeedom-plugin-ajaxsiabe/blob/master/docs/#language#/index.md",
+    "changelog": "https://github.com/replicatorbe/jeedom-plugin-ajaxsiabe/blob/master/docs/#language#/changelog.md",
+    "language": [
+        "fr_FR"
+    ],
+    "compatibility": [
+        "smart",
+        "rpi",
+        "docker",
+        "diy"
+    ]
+}

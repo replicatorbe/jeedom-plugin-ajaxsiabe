@@ -1,0 +1,13 @@
+# Contrôles de conformité du plugin (syntaxe PHP, structure, info.json).
+# Workflow réutilisable maintenu par Jeedom, utilisé par les plugins officiels.
+name: 'Full Workflows Plugin Jeedom'
+
+on:
+  push:
+    branches: [beta]
+  pull_request:
+    branches: [beta, master]
+
+jobs:
+  plugin:
+    uses: jeedom/workflows/.github/workflows/plugin.yml@main

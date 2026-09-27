@@ -1,0 +1,10 @@
+# Exclusions propres au plugin ajaxsiabe, ajoutées à celles de deploy-plugin.sh.
+# Un motif rsync par ligne.
+
+# Le journal SIA est produit à l'exécution et n'existe que côté Jeedom. Le
+# déploiement travaille avec --delete : sans cette ligne, chaque déploiement
+# effacerait tout l'historique des trames reçues.
+data/journal/
+
+# Jeux d'essai : outils de développement, inutiles côté Jeedom.
+tests/
