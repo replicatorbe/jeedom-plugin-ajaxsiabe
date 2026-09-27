@@ -17,7 +17,9 @@
     "eventjs": 0,
     "issue": "https://github.com/replicatorbe/jeedom-plugin-ajaxsiabe/issues",
     "documentation": "https://github.com/replicatorbe/jeedom-plugin-ajaxsiabe/blob/master/docs/#language#/index.md",
+    "documentation_beta": "https://github.com/replicatorbe/jeedom-plugin-ajaxsiabe/blob/beta/docs/#language#/index.md",
     "changelog": "https://github.com/replicatorbe/jeedom-plugin-ajaxsiabe/blob/master/docs/#language#/changelog.md",
+    "changelog_beta": "https://github.com/replicatorbe/jeedom-plugin-ajaxsiabe/blob/beta/docs/#language#/changelog.md",
     "language": [
         "fr_FR"
     ],

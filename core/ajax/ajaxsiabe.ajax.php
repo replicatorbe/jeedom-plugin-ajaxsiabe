@@ -37,6 +37,7 @@ try {
                 'name'        => $hub->getName(),
                 'account'     => $hub->getConfiguration('account'),
                 'lastContact' => $last,
+                'enabled'     => (int) $hub->getIsEnable(),
                 'supervision' => $hub->supervisionDelay(),
             );
         }
@@ -44,6 +45,7 @@ try {
             'daemon' => $info['state'],
             'status' => ($info['state'] == 'ok') ? ajaxsiabe::daemonStatus() : null,
             'hubs'   => $hubs,
+            'daemonStart' => (int) cache::byKey('ajaxsiabe::daemonStart')->getValue(0),
             'now'    => time(),
         ));
     }
@@ -53,7 +55,7 @@ try {
     }
 
     if (init('action') == 'journal') {
-        ajax::success(ajaxsiabe::readJournal(init('date', date('Y-m-d')), array(
+        ajax::success(ajaxsiabe::readJournal(init('date', ''), array(
             'account'  => init('account', ''),
             'tests'    => init('tests', 1) == 1,
             'problems' => init('problems', 0) == 1,

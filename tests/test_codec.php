@@ -26,7 +26,7 @@ $keys = function () use ($key) { return array($key); };
 /* CRC-16/ARC, valeur de contrôle du catalogue des CRC. */
 check('CRC de « 123456789 »', AjaxSiaCodec::crc('123456789') === 'BB3D');
 
-/* Trame chiffrée venue d'ailleurs : bourrage de zéros sans « | », pas de
+/* Trame chiffrée venue d'ailleurs : bourrage de zéros suivi de « | », pas de
  * compte répété dans les données. */
 $frame = '05BB0076"*SIA-DCS"7654L0#1111[C07DA1EB73C617857476EE5D79436CEE5E0084485E79EC56B0D5D1F3F6E648B278050BBCCBC8FE5DCA7E3C80DBDD4945';
 $now = gmmktime(16, 4, 10, 7, 9, 2020);
@@ -133,6 +133,61 @@ check('première trame extraite, seconde en attente', count($frames) === 1 && $b
 $buffer .= substr($b, 10);
 $frames = AjaxSiaCodec::extractFrames($buffer);
 check('seconde trame complétée', count($frames) === 1 && $buffer === '' && AjaxSiaCodec::parse($frames[0])['seq'] === '0011');
+
+/* Cas relevés en relecture. */
+$raw = AjaxSiaCodec::build('SIA-DCS', 5, '1234', 'Nid3/ri2/OP3^Jérôme^', $key);
+$frames = AjaxSiaCodec::extractFrames($raw);
+$m = AjaxSiaCodec::parse($frames[0], $keys);
+check('chiffré avec texte accentué', $m['status'] === 'ok' && $m['events'][0]['text'] === 'Jérôme');
+
+/* Bourrage binaire (octets hors ASCII) : accepté, seul compte la fin du texte. */
+$plain = "\x81\xF0\x07\x99|#1234|Nri1/CL1]" . AjaxSiaCodec::timestamp();
+$plain = str_repeat("\x80", 16 - strlen($plain) % 16) . $plain;
+$hex = strtoupper(bin2hex(openssl_encrypt($plain, 'aes-128-cbc', $key, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING, str_repeat("\0", 16))));
+$body = '"*SIA-DCS"0006L0#1234[' . $hex;
+$m = AjaxSiaCodec::parse(AjaxSiaCodec::crc($body) . sprintf('%04X', strlen($body)) . $body, $keys);
+check('bourrage binaire accepté', $m['status'] === 'ok' && $m['events'][0]['code'] === 'CL');
+
+/* Bourrage contenant « ] » et « | » : les données sont retrouvées par « #compte| ». */
+$plain = "0]0|000|#1234|Nri1/BA7]" . AjaxSiaCodec::timestamp();
+$plain = str_repeat('0', 16 - strlen($plain) % 16) . $plain;
+$hex = strtoupper(bin2hex(openssl_encrypt($plain, 'aes-128-cbc', $key, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING, str_repeat("\0", 16))));
+$body = '"*SIA-DCS"0007L0#1234[' . $hex;
+$m = AjaxSiaCodec::parse(AjaxSiaCodec::crc($body) . sprintf('%04X', strlen($body)) . $body, $keys);
+check('bourrage contenant ] et |', $m['status'] === 'ok' && isset($m['events'][0]) && $m['events'][0]['code'] === 'BA' && $m['events'][0]['addr'] === '7');
+
+/* Longueur écrite en décimal mais CRC juste : acceptée, signalée. */
+$body = '"ADM-CID"0247R4F39L4F39#4F39[#4F39|3401 01 057]';
+$m = AjaxSiaCodec::parse('5715' . '0047' . $body);
+check('longueur fausse, CRC juste : accepté avec remarque', $m['status'] === 'ok' && $m['warning'] !== '' && $m['events'][0]['code'] === 'CL');
+
+/* Compte en minuscules : l'accusé le reprend tel quel. */
+$raw = AjaxSiaCodec::build('SIA-DCS', 8, 'abc12', 'Nri1/CL1');
+$frames = AjaxSiaCodec::extractFrames($raw);
+$m = AjaxSiaCodec::parse($frames[0]);
+check('compte en minuscules : recherche en majuscules', $m['account'] === 'ABC12');
+check('compte en minuscules : accusé à l\'identique', strpos(AjaxSiaCodec::ack($m), '#abc12[') !== false);
+
+/* Espace dans le corps : conservé, CRC juste. */
+$body = '"SIA-DCS"0009L0#1234[#1234|Nri1/BA1^Porte ^]';
+$buffer = "\n" . AjaxSiaCodec::crc($body) . sprintf('%04X', strlen($body)) . $body . "\r";
+$frames = AjaxSiaCodec::extractFrames($buffer);
+check('espace final conservé', AjaxSiaCodec::parse($frames[0])['status'] === 'ok');
+
+/* Données illisibles : accusé, mais signalé. */
+$raw = AjaxSiaCodec::build('SIA-DCS', 10, '1234', 'n\'importe quoi');
+$frames = AjaxSiaCodec::extractFrames($raw);
+$m = AjaxSiaCodec::parse($frames[0]);
+check('données illisibles signalées', $m['status'] === 'ok' && empty($m['events']) && strpos($m['warning'], 'aucun événement') !== false);
+
+/* Caractère de contrôle : jamais recopié dans le journal. */
+check('caractère de contrôle neutralisé', AjaxSiaCodec::clean("a\nb\x01") === 'a?b?');
+
+/* Contact ID corrigés. */
+check('Contact ID 3456 : armement partiel', AjaxSiaCodec::parseContactId('3456 02 000')[0]['code'] === 'CG');
+check('Contact ID 3402 : armement de groupe', AjaxSiaCodec::describe(AjaxSiaCodec::parseContactId('3402 02 000')[0]['code'])['e']['arm'] === 'armed');
+check('Contact ID 1384 : pile faible', AjaxSiaCodec::parseContactId('1384 01 007')[0]['code'] === 'XT');
+check('Contact ID inconnu : code vide, numéro gardé', AjaxSiaCodec::parseContactId('1999 01 001')[0]['code'] === '' && AjaxSiaCodec::parseContactId('1999 01 001')[0]['cid'] === '1999');
 
 /* Dictionnaire. */
 $info = AjaxSiaCodec::describe('BA');

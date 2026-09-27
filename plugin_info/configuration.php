@@ -22,7 +22,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 				<input type="checkbox" class="configKey" data-l1key="udp">
 			</div>
 			<div class="col-md-5">
-				<span class="help-block" style="margin:0;">{{Les hubs Ajax émettent en TCP ; l'UDP sert à d'autres centrales. Le même port est ouvert dans les deux cas.}}</span>
+				<span class="help-block" style="margin:0;">{{Les hubs Ajax émettent en TCP : laissez décoché sauf besoin. L'UDP sert à d'autres centrales, et son adresse d'émetteur peut être usurpée, ce qui affaiblit la liste des adresses autorisées.}}</span>
 			</div>
 		</div>
 		<div class="form-group">
@@ -31,7 +31,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 				<input type="password" autocomplete="new-password" class="configKey form-control" data-l1key="key" placeholder="{{16, 24 ou 32 caractères}}">
 			</div>
 			<div class="col-md-4">
-				<span class="help-block" style="margin:0;">{{La clé saisie dans Ajax PRO. Elle sert aux hubs qui n'ont pas la leur, et permet de découvrir un hub dont les messages sont chiffrés. Laisser vide si le chiffrement n'est pas activé.}}</span>
+				<span class="help-block" style="margin:0;">{{La clé saisie dans Ajax PRO : 16, 24 ou 32 caractères. Elle sert aux hubs qui n'ont pas la leur et permet de découvrir un hub chiffré. Dès qu'elle est saisie, tout message en clair est refusé : personne sur le réseau ne peut alors simuler un désarmement. Laisser vide seulement si le chiffrement n'est pas activé côté Ajax.}}</span>
 			</div>
 		</div>
 		<div class="form-group">
@@ -49,7 +49,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 				<input class="configKey form-control" data-l1key="allowed" placeholder="{{toutes}}">
 			</div>
 			<div class="col-md-4">
-				<span class="help-block" style="margin:0;">{{Adresses IP des hubs, séparées par des virgules. Vide : tout émetteur est accepté. Les connexions refusées figurent au journal.}}</span>
+				<span class="help-block" style="margin:0;">{{Adresses IP des hubs, séparées par des virgules. Vide : tout émetteur est accepté. Les refus figurent au journal, résumés par minute et par émetteur.}}</span>
 			</div>
 		</div>
 	</fieldset>
@@ -62,7 +62,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 				<input type="checkbox" class="configKey" data-l1key="autocreate">
 			</div>
 			<div class="col-md-5">
-				<span class="help-block" style="margin:0;">{{Un équipement est créé au premier message d'un numéro de compte inconnu. Décoché, ces messages sont seulement accusés et gardés au journal.}}</span>
+				<span class="help-block" style="margin:0;">{{Un équipement est créé au premier message d'un numéro de compte inconnu, cinq hubs au plus. Décoché, ces messages sont seulement accusés et gardés au journal ; créez alors le hub à la main.}}</span>
 			</div>
 		</div>
 		<div class="form-group">
@@ -71,7 +71,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 				<input type="number" min="1" max="3650" class="configKey form-control" data-l1key="journal_days" placeholder="90">
 			</div>
 			<div class="col-md-5">
-				<span class="help-block" style="margin:0;">{{Chaque trame reçue y est gardée, y compris les tests de liaison et les messages refusés.}}</span>
+				<span class="help-block" style="margin:0;">{{Chaque trame reçue y est gardée, y compris les tests de liaison et les messages refusés, dans la limite de 50 Mo par jour. Le journal est exclu des sauvegardes de Jeedom.}}</span>
 			</div>
 		</div>
 	</fieldset>
@@ -81,7 +81,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 		<div class="form-group">
 			<label class="col-md-4 control-label">{{Port des ordres (local)}}</label>
 			<div class="col-md-2">
-				<input type="number" class="configKey form-control" data-l1key="socketport" placeholder="55065">
+				<input type="number" min="1024" max="65535" class="configKey form-control" data-l1key="socketport" placeholder="55065">
 			</div>
 			<div class="col-md-5">
 				<span class="help-block" style="margin:0;">{{Port sur 127.0.0.1 par lequel Jeedom parle au démon. À changer uniquement en cas de conflit, puis redémarrer le démon.}}</span>

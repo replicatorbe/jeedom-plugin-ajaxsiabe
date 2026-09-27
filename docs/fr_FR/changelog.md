@@ -11,3 +11,9 @@ Première version.
 - Mode, alarmes, sabotages, secteur, batteries, liaisons et brouillage.
 - Supervision de la liaison réglée seule sur l'intervalle des tests du hub.
 - Journal SIA de toutes les trames reçues, avec suivi en direct.
+- Messages en clair refusés dès qu'une clé est connue ; clés des hubs
+  stockées chiffrées.
+- Mode suivi par groupe ; le désarmement n'efface plus les alarmes
+  techniques en cours.
+- Réception protégée contre les connexions muettes, le bruit et les
+  changements de port impossibles.

@@ -55,9 +55,9 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 			echo '<ol style="margin:5px 0 0 0;padding-left:20px;">';
 			echo '<li>{{Dans l\'application Ajax PRO : Hub → Paramètres → Centre de télésurveillance.}}</li>';
 			echo '<li>{{Protocole}} <b>SIA DC-09 (SIA-DCS)</b>, {{adresse IP}} <b>' . htmlspecialchars($internalAddr != '' ? $internalAddr : '{{celle de Jeedom}}') . '</b>, {{port}} <b>' . $port . '</b>.</li>';
-			echo '<li>{{Un numéro d\'objet (le compte, 3 à 16 caractères hexadécimaux) et, recommandé, une clé de chiffrement que vous reportez dans la configuration du plugin.}}</li>';
+			echo '<li>{{Un numéro d\'objet (le compte, 3 à 16 caractères hexadécimaux) et une clé de chiffrement, que vous reportez dans la configuration du plugin. Avec une clé, Jeedom refuse tout message en clair : personne ne peut lui faire croire à un désarmement.}}</li>';
 			echo '<li>{{Un intervalle de test court (1 à 5 minutes) : c\'est lui qui permet à Jeedom de voir tomber la liaison.}}</li>';
-			echo '<li>{{Le hub apparaît ici dès son premier message, et chaque appareil au premier événement qui le concerne.}}</li>';
+			echo '<li>{{Le hub apparaît ici dès son premier message (rechargez la page), et chaque appareil au premier événement qui le concerne. Si « Créer les hubs inconnus » est décoché dans la configuration, créez le hub à la main avec son numéro de compte.}}</li>';
 			echo '</ol>';
 			echo '</div>';
 		}
@@ -85,7 +85,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 		};
 
 		foreach ($hubs as $hub) {
-			echo '<legend><i class="fas fa-shield-alt"></i> ' . $hub->getName() . ' <small>#' . htmlspecialchars($hub->getConfiguration('account')) . '</small></legend>';
+			echo '<legend><i class="fas fa-shield-alt"></i> ' . htmlspecialchars($hub->getName()) . ' <small>#' . htmlspecialchars($hub->getConfiguration('account')) . '</small></legend>';
 			echo '<div class="eqLogicThumbnailContainer">';
 			$displayCard($hub, 'fa-shield-alt');
 			$zones = isset($zonesByHub[(int) $hub->getId()]) ? $zonesByHub[(int) $hub->getId()] : array();
@@ -175,7 +175,10 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 								<input type="checkbox" class="eqLogicAttr" data-l1key="isVisible" checked>
 							</div>
 						</div>
-						<div class="form-group">
+						<!-- Choisi à la création seulement : printEqLogic masque ce bloc pour
+						     un équipement enregistré. Un hub changé en appareil perdrait ses
+						     zones et serait recréé au message suivant. -->
+						<div class="form-group" id="div_ajaxsiabeType">
 							<label class="col-sm-3 control-label">{{Type d'équipement}}</label>
 							<div class="col-sm-3">
 								<select class="eqLogicAttr form-control" id="sel_ajaxsiabeType" data-l1key="configuration" data-l2key="type">
@@ -195,7 +198,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 								<input type="text" class="eqLogicAttr form-control" data-l1key="configuration" data-l2key="account" placeholder="1234">
 							</div>
 							<div class="col-sm-5">
-								<span class="help-block" style="margin:0;">{{Le « numéro d'objet » saisi dans Ajax PRO : 3 à 16 caractères hexadécimaux. Rempli tout seul quand le hub est découvert.}}</span>
+								<span class="help-block" style="margin:0;">{{Le « numéro d'objet » saisi dans Ajax PRO : 3 à 16 caractères hexadécimaux selon la norme (Jeedom en accepte de 1 à 16). Rempli tout seul quand le hub est découvert.}}</span>
 							</div>
 						</div>
 						<div class="form-group">
@@ -204,7 +207,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 								<input type="password" autocomplete="new-password" class="eqLogicAttr form-control" data-l1key="configuration" data-l2key="key" placeholder="{{clé générale}}">
 							</div>
 							<div class="col-sm-5">
-								<span class="help-block" style="margin:0;">{{Propre à ce hub : 16, 24 ou 32 caractères. Vide, c'est la clé de la configuration du plugin qui sert.}}</span>
+								<span class="help-block" style="margin:0;">{{Propre à ce hub : 16, 24 ou 32 caractères, stockée chiffrée. Vide, c'est la clé de la configuration du plugin qui sert. Dès qu'une clé s'applique, les messages en clair de ce hub sont refusés.}}</span>
 							</div>
 						</div>
 						<div class="form-group">
@@ -213,7 +216,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 								<input type="number" min="0" class="eqLogicAttr form-control" data-l1key="configuration" data-l2key="supervision" placeholder="{{auto}}">
 							</div>
 							<div class="col-sm-6">
-								<span class="help-block" style="margin:0;">{{Vide : réglé tout seul sur l'intervalle des tests de liaison envoyés par le hub, à deux tests et demi manqués.}} <span id="span_ajaxsiabeSupervision"></span></span>
+								<span class="help-block" style="margin:0;">{{Vide : réglé tout seul sur l'intervalle des tests de liaison envoyés par le hub, à deux tests et demi manqués (trois minutes au moins).}} <span id="span_ajaxsiabeSupervision"></span></span>
 							</div>
 						</div>
 						<div class="form-group">
@@ -240,7 +243,7 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 								<textarea class="eqLogicAttr form-control" rows="2" data-l1key="configuration" data-l2key="groups" placeholder="1=Maison&#10;2=Garage"></textarea>
 							</div>
 							<div class="col-sm-4">
-								<span class="help-block" style="margin:0;">{{En mode groupes : numéro=nom, pour que les événements disent quel groupe est concerné.}}</span>
+								<span class="help-block" style="margin:0;">{{En mode groupes seulement : numéro=nom. Les déclarer active le suivi du mode groupe par groupe (Armé partiel quand certains seulement sont armés) et nomme le groupe dans les événements. Vide : tout armement vaut pour le système entier.}}</span>
 							</div>
 						</div>
 					</fieldset>
@@ -252,9 +255,10 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 							<label class="col-sm-3 control-label">{{Hub}}</label>
 							<div class="col-sm-3">
 								<select class="eqLogicAttr form-control" data-l1key="configuration" data-l2key="hub_id">
+									<option value="">{{Aucun (hub supprimé)}}</option>
 									<?php
 									foreach ($hubs as $hub) {
-										echo '<option value="' . $hub->getId() . '">' . $hub->getName() . '</option>';
+										echo '<option value="' . $hub->getId() . '">' . htmlspecialchars($hub->getName()) . '</option>';
 									}
 									?>
 								</select>

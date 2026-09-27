@@ -14,8 +14,14 @@
  * along with Jeedom. If not, see <http://www.gnu.org/licenses/>.
  */
 
-/* Appel à core/ajax/ajaxsiabe.ajax.php. */
-function ajaxsiabeAjax(_action, _data, _success) {
+/* Appel à core/ajax/ajaxsiabe.ajax.php. _failure reçoit un message en cas
+   d'échec : session expirée, erreur serveur, réponse refusée. */
+function ajaxsiabeAjax(_action, _data, _success, _failure) {
+  var fail = function (_message) {
+    if (typeof _failure === 'function') {
+      _failure(_message)
+    }
+  }
   domUtils.ajax({
     type: 'POST',
     url: 'plugins/ajaxsiabe/core/ajax/ajaxsiabe.ajax.php',
@@ -23,27 +29,33 @@ function ajaxsiabeAjax(_action, _data, _success) {
     dataType: 'json',
     global: false,
     noDisplayError: true,
-    error: function () {},
+    error: function () {
+      fail('{{Jeedom ne répond pas, ou la session a expiré.}}')
+    },
     success: function (data) {
-      if (data.state == 'ok') {
-        _success(data.result)
+      if (data.state != 'ok') {
+        fail(data.result)
+        return
       }
+      _success(data.result)
     }
   })
 }
 
-/* « il y a 3 min » : plus parlant qu'une date pour juger d'une liaison. */
+/* « il y a 1 h 30 min » : plus parlant qu'une date pour juger d'une liaison. */
 function ajaxsiabeAgo(_seconds) {
-  if (_seconds < 60) {
-    return _seconds + ' s'
+  var s = Math.max(0, Math.round(_seconds))
+  if (s < 60) {
+    return s + ' s'
   }
-  if (_seconds < 3600) {
-    return Math.floor(_seconds / 60) + ' min'
+  if (s < 3600) {
+    return Math.floor(s / 60) + ' min'
   }
-  if (_seconds < 86400) {
-    return Math.floor(_seconds / 3600) + ' h'
+  if (s < 86400) {
+    var minutes = Math.floor((s % 3600) / 60)
+    return Math.floor(s / 3600) + ' h' + (minutes > 0 ? ' ' + minutes + ' min' : '')
   }
-  return Math.floor(_seconds / 86400) + ' j'
+  return Math.floor(s / 86400) + ' j'
 }
 
 /* Affiche le bloc de configuration du type d'équipement. */
@@ -61,7 +73,26 @@ function ajaxsiabeToggleType() {
   })
 }
 
-/* Bandeau d'état du récepteur, sur la page des équipements. */
+/* Remplit le bandeau d'état : une ligne par élément, en texte seulement. */
+function ajaxsiabeBanner(_css, _lines) {
+  var target = document.getElementById('div_ajaxsiabeStatus')
+  if (target === null) {
+    return
+  }
+  target.className = 'alert alert-' + _css
+  target.textContent = ''
+  for (var i = 0; i < _lines.length; i++) {
+    var line = document.createElement('div')
+    var icon = document.createElement('i')
+    icon.className = 'fas ' + _lines[i][0]
+    line.appendChild(icon)
+    line.appendChild(document.createTextNode(' ' + _lines[i][1]))
+    target.appendChild(line)
+  }
+}
+
+/* Bandeau d'état du récepteur, sur la page des équipements. Interrogé
+   seulement quand il est visible : pas pendant l'édition d'un équipement. */
 function ajaxsiabeRefreshStatus() {
   var box = document.getElementById('div_ajaxsiabeStatus')
   if (box === null) {
@@ -71,53 +102,66 @@ function ajaxsiabeRefreshStatus() {
     }
     return
   }
+  if (box.offsetParent === null) {
+    return
+  }
   ajaxsiabeAjax('status', {}, function (result) {
-    var target = document.getElementById('div_ajaxsiabeStatus')
-    if (target === null) {
-      return
-    }
-    target.textContent = ''
-    var line = document.createElement('div')
-    var icon = document.createElement('i')
-    if (result.daemon != 'ok' || !result.status) {
-      target.className = 'alert alert-danger'
-      icon.className = 'fas fa-exclamation-triangle'
-      line.appendChild(icon)
-      line.appendChild(document.createTextNode(' {{Récepteur arrêté : aucun message ne peut être reçu. Démarrez le démon depuis la page Plugins.}}'))
-      target.appendChild(line)
+    if (result.daemon != 'ok') {
+      ajaxsiabeBanner('danger', [['fa-exclamation-triangle', '{{Récepteur arrêté : aucun message ne peut être reçu. Démarrez le démon depuis la page du plugin.}}']])
       return
     }
     var status = result.status
-    target.className = 'alert alert-success'
-    icon.className = 'fas fa-satellite-dish'
-    line.appendChild(icon)
-    var text = ' {{Récepteur à l\'écoute sur le port}} ' + status.port + (status.udp ? ' (TCP + UDP)' : ' (TCP)')
-    text += ' — ' + status.frames + ' {{trame(s) depuis le démarrage}}'
+    if (!status) {
+      ajaxsiabeBanner('warning', [['fa-question-circle', '{{Le démon tourne mais ne répond pas. Consultez le log ajaxsiabed, ou redémarrez le démon.}}']])
+      return
+    }
+    var lines = []
+    var css = 'success'
+    if (!status.tcp) {
+      css = 'danger'
+      lines.push(['fa-exclamation-triangle', '{{Récepteur sourd : le port}} ' + status.port + ' {{n\'a pas pu être ouvert.}} ' + (status.listenError || '')])
+    } else {
+      var text = '{{Récepteur à l\'écoute sur le port}} ' + status.tcp + (status.udp ? ' (TCP + UDP)' : ' (TCP)')
+      if (status.tcp !== status.port) {
+        css = 'warning'
+        text += ' — {{le port}} ' + status.port + ' {{demandé n\'a pas pu être ouvert, nouvel essai toutes les 30 s}}'
+      } else if (status.wantUdp && !status.udp) {
+        css = 'warning'
+        text += ' — {{UDP n\'a pas pu être ouvert}}'
+      }
+      lines.push(['fa-satellite-dish', text])
+    }
+    var counts = status.frames + ' {{trame(s) depuis le démarrage du démon}}'
     if (status.rejected > 0) {
-      text += ', ' + status.rejected + ' {{refusée(s)}}'
+      counts += ', ' + status.rejected + ' {{refusée(s)}}'
     }
     if (status.lastFrame > 0) {
-      text += ' — {{dernière il y a}} ' + ajaxsiabeAgo(result.now - status.lastFrame)
+      counts += ' — {{dernière il y a}} ' + ajaxsiabeAgo(result.now - status.lastFrame)
     }
-    line.appendChild(document.createTextNode(text))
-    target.appendChild(line)
+    lines.push(['fa-chart-bar', counts])
 
     for (var i = 0; i < result.hubs.length; i++) {
       var hub = result.hubs[i]
-      var hubLine = document.createElement('div')
-      var hubIcon = document.createElement('i')
-      var late = (hub.supervision > 0 && hub.lastContact > 0 && result.now - hub.lastContact > hub.supervision)
-      hubIcon.className = late ? 'fas fa-unlink' : 'fas fa-shield-alt'
-      hubLine.appendChild(hubIcon)
-      var hubText = ' ' + hub.name + ' (#' + hub.account + ') : '
-      hubText += (hub.lastContact > 0) ? '{{dernier message il y a}} ' + ajaxsiabeAgo(result.now - hub.lastContact) : '{{aucun message depuis le redémarrage de Jeedom}}'
+      /* Même référence que la supervision : jamais avant le démarrage du démon. */
+      var since = Math.max(hub.lastContact, result.daemonStart || 0)
+      var late = (hub.enabled == 1 && hub.supervision > 0 && since > 0 && result.now - since > hub.supervision)
+      var hubText = hub.name + (hub.account ? ' (#' + hub.account + ')' : '') + ' : '
+      if (hub.enabled != 1) {
+        hubText += '{{désactivé}}'
+      } else {
+        hubText += (hub.lastContact > 0) ? '{{dernier message il y a}} ' + ajaxsiabeAgo(result.now - hub.lastContact) : '{{aucun message reçu}}'
+      }
       if (late) {
         hubText += ' — {{liaison perdue}}'
-        target.className = 'alert alert-warning'
+        if (css === 'success') {
+          css = 'warning'
+        }
       }
-      hubLine.appendChild(document.createTextNode(hubText))
-      target.appendChild(hubLine)
+      lines.push([late ? 'fa-unlink' : 'fa-shield-alt', hubText])
     }
+    ajaxsiabeBanner(css, lines)
+  }, function (_message) {
+    ajaxsiabeBanner('info', [['fa-question-circle', '{{État du récepteur inconnu :}} ' + _message]])
   })
 }
 
@@ -131,9 +175,15 @@ function ajaxsiabeShowSupervision(_eqLogic) {
   if (!isset(_eqLogic) || !isset(_eqLogic.id) || _eqLogic.id == '') {
     return
   }
+  var wanted = String(_eqLogic.id)
   ajaxsiabeAjax('status', {}, function (result) {
+    /* La réponse peut arriver après qu'on a ouvert un autre équipement. */
+    var current = document.querySelector('.eqLogicAttr[data-l1key="id"]')
+    if (current === null || current.value !== wanted) {
+      return
+    }
     for (var i = 0; i < result.hubs.length; i++) {
-      if (String(result.hubs[i].id) === String(_eqLogic.id)) {
+      if (String(result.hubs[i].id) === wanted) {
         var delay = result.hubs[i].supervision
         span.textContent = (delay > 0)
           ? '{{Délai appliqué :}} ' + ajaxsiabeAgo(delay) + '.'
@@ -144,6 +194,20 @@ function ajaxsiabeShowSupervision(_eqLogic) {
 }
 
 function printEqLogic(_eqLogic) {
+  var saved = isset(_eqLogic) && isset(_eqLogic.id) && _eqLogic.id != ''
+  /* Le type se choisit à la création : ensuite, un hub changé en appareil
+     perdrait ses zones. */
+  var typeRow = document.getElementById('div_ajaxsiabeType')
+  if (typeRow !== null) {
+    typeRow.style.display = saved ? 'none' : ''
+  }
+  /* Le coeur ne touche pas une case à cocher dont la clé est absente : elle
+     garderait l'état de l'équipement ouvert avant. */
+  var configuration = (isset(_eqLogic) && isset(_eqLogic.configuration)) ? _eqLogic.configuration : {}
+  var autozone = document.querySelector('.eqLogicAttr[data-l2key="autozone"]')
+  if (autozone !== null && !isset(configuration.autozone)) {
+    autozone.checked = true
+  }
   ajaxsiabeToggleType()
   ajaxsiabeShowSupervision(_eqLogic)
 }
@@ -195,7 +259,8 @@ function addCmdToTable(_cmd) {
     tr += '<a class="btn btn-default btn-xs cmdAction" data-action="configure"><i class="fas fa-cogs"></i></a> '
     tr += '<a class="btn btn-default btn-xs cmdAction" data-action="test"><i class="fas fa-rss"></i> {{Tester}}</a> '
   }
-  tr += '<a class="btn btn-danger btn-xs cmdAction pull-right" data-action="remove"><i class="fas fa-minus-circle"></i></a>'
+  /* Pas de bouton de suppression : les commandes sont celles du plugin, et
+     l'enregistrement suivant les recréerait. */
   tr += '</td>'
 
   /* Une ligne créée en DOM : insertAdjacentHTML sur la table générerait un

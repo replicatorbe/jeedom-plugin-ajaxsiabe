@@ -24,10 +24,23 @@ class ajaxsiabe extends eqLogic {
     const TYPE_HUB  = 'hub';
     const TYPE_ZONE = 'zone';
 
+    /* Numéros d'appareil admis : au-delà, ce n'est pas un appareil Ajax mais
+     * une trame fabriquée, qui ferait naître des équipements à volonté. */
+    const ZONE_MAX = 999;
+
+    /* Hubs créés automatiquement, au plus : un émetteur qui inventerait des
+     * numéros de compte ne doit pas pouvoir remplir Jeedom d'équipements. */
+    const AUTO_HUBS_MAX = 5;
+
     /* Un seul rechargement du démon par requête, même si dix équipements sont enregistrés. */
     private static $_reloadScheduled = false;
 
-    /* La clé générale de chiffrement est stockée chiffrée par le coeur. */
+    /* Zones de chaque hub, lues une fois par requête. */
+    private static $_zoneCache = array();
+
+    /* La clé générale de chiffrement est stockée chiffrée par le coeur. Celle
+     * de chaque hub l'est par preSave(), le coeur ne chiffrant pas la
+     * configuration des équipements. */
     public static $_encryptConfigKey = array('key');
 
     /* Libellés de la commande « Mode ». Ce sont les valeurs que lit un scénario :
@@ -42,13 +55,14 @@ class ajaxsiabe extends eqLogic {
     /*
      * Commandes d'un hub. 'invert' pour les états dont 1 signale un problème :
      * au repos le widget montre une coche verte, une croix rouge seulement quand
-     * il y a lieu de s'inquiéter.
+     * il y a lieu de s'inquiéter. 'repeat' : chaque nouvel événement déclenche
+     * les scénarios, même si la valeur ne change pas.
      */
     public static $_hubCommands = array(
         array('logicalId' => 'arming',       'name' => 'Mode',                   'type' => 'info',   'subType' => 'string', 'isHistorized' => 1, 'generic_type' => 'ALARM_MODE'),
         array('logicalId' => 'armed',        'name' => 'Armée',                  'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'ALARM_ENABLE_STATE'),
         array('logicalId' => 'arming_by',    'name' => 'Mode changé par',        'type' => 'info',   'subType' => 'string'),
-        array('logicalId' => 'alarm',        'name' => 'Alarme',                 'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'ALARM_STATE', 'invert' => 1, 'initial' => 0),
+        array('logicalId' => 'alarm',        'name' => 'Alarme',                 'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'ALARM_STATE', 'invert' => 1, 'initial' => 0, 'repeat' => 1),
         array('logicalId' => 'alarm_type',   'name' => 'Type d\'alarme',         'type' => 'info',   'subType' => 'string'),
         array('logicalId' => 'alarm_zone',   'name' => 'Origine de l\'alarme',   'type' => 'info',   'subType' => 'string'),
         array('logicalId' => 'reset_alarm',  'name' => 'Acquitter l\'alarme',    'type' => 'action', 'subType' => 'other'),
@@ -110,18 +124,33 @@ class ajaxsiabe extends eqLogic {
             throw new Exception(__('Démon introuvable dans resources/ajaxsiabed/', __FILE__));
         }
 
-        /* La clé API passe par l'entrée standard, pas par la ligne de commande
-         * que n'importe quel utilisateur local lit avec `ps`. */
         $cmd  = 'php ' . escapeshellarg($daemon);
         $cmd .= ' --callback '   . escapeshellarg(self::getCallbackUrl());
         $cmd .= ' --pid '        . escapeshellarg(jeedom::getTmpFolder(__CLASS__) . '/deamon.pid');
         $cmd .= ' --socketport ' . escapeshellarg(config::byKey('socketport', __CLASS__, 55065));
         $cmd .= ' --loglevel '   . escapeshellarg(log::convertLogLevel(log::getLogLevel(__CLASS__)));
-
         log::add(__CLASS__, 'info', __('Lancement du démon :', __FILE__) . ' ' . $cmd);
-        $full = 'echo ' . escapeshellarg(jeedom::getApiKey(__CLASS__)) . ' | ' . $cmd
-              . ' >> ' . log::getPathToLog(__CLASS__ . 'd') . ' 2>&1 &';
-        exec($full);
+
+        /*
+         * La clé API est écrite sur l'entrée standard du démon, par un tube : elle
+         * n'apparaît dans aucune ligne de commande, pas même celle du shell qui
+         * le lance, que tout utilisateur local lirait avec `ps`. Le démon part en
+         * arrière-plan en gardant le tube ; le shell rend la main aussitôt.
+         *
+         * Le détour par le descripteur 3 est indispensable : un shell non
+         * interactif (dash) branche l'entrée d'une commande lancée avec « & »
+         * sur /dev/null, et le démon ne recevrait jamais la clé.
+         */
+        $process = proc_open(array('sh', '-c', 'exec 3<&0; ' . $cmd . ' <&3 3<&- >> '
+                                   . escapeshellarg(log::getPathToLog(__CLASS__ . 'd')) . ' 2>&1 &'),
+                             array(0 => array('pipe', 'r')), $pipes);
+        if (!is_resource($process)) {
+            throw new Exception(__('Lancement du démon impossible', __FILE__));
+        }
+        fwrite($pipes[0], jeedom::getApiKey(__CLASS__) . "\n");
+        fclose($pipes[0]);
+        proc_close($process);
+        cache::set('ajaxsiabe::daemonStart', time());
 
         for ($i = 0; $i < 30; $i++) {
             if (self::deamon_info()['state'] == 'ok') {
@@ -154,6 +183,12 @@ class ajaxsiabe extends eqLogic {
              . '/plugins/ajaxsiabe/core/php/jeeAjaxsiabe.php';
     }
 
+    /* Le journal SIA peut peser des dizaines de Mo : il n'a pas sa place dans
+     * chaque sauvegarde de Jeedom. */
+    public static function backupExclude() {
+        return array('data/journal');
+    }
+
     /* Configuration lue par le démon sur son callback (action=config). */
     public static function getDaemonConfig() {
         $hubs = array();
@@ -164,19 +199,29 @@ class ajaxsiabe extends eqLogic {
             }
             $hubs[$account] = array(
                 'id'  => (int) $hub->getId(),
-                'key' => trim((string) $hub->getConfiguration('key')),
+                'key' => $hub->hubKey(),
             );
         }
         return array(
             'timezone'     => config::byKey('timezone', 'core', 'Europe/Brussels'),
             'port'         => (int) config::byKey('port', __CLASS__, 7777),
-            'udp'          => (int) config::byKey('udp', __CLASS__, 1),
-            'key'          => trim((string) config::byKey('key', __CLASS__, '')),
+            'udp'          => (int) config::byKey('udp', __CLASS__, 0),
+            'key'          => self::generalKey(),
             'strict_time'  => (int) config::byKey('strict_time', __CLASS__, 1),
             'journal_days' => (int) config::byKey('journal_days', __CLASS__, 90),
             'allowed'      => self::allowedAddresses(),
             'hubs'         => $hubs,
         );
+    }
+
+    public static function generalKey() {
+        return trim((string) config::byKey('key', __CLASS__, ''));
+    }
+
+    /* Clé propre au hub, déchiffrée. */
+    public function hubKey() {
+        $key = (string) $this->getConfiguration('key');
+        return ($key === '') ? '' : trim((string) utils::decrypt($key));
     }
 
     /* Liste blanche saisie librement : virgules, espaces ou retours à la ligne. */
@@ -207,7 +252,23 @@ class ajaxsiabe extends eqLogic {
     }
 
     /* Réglages de la page de configuration : le démon les relit sans redémarrer,
-     * et rouvre son écoute si le port a changé. */
+     * et déplace son écoute si le port a changé. */
+    public static function preConfig_port($_value) {
+        $port = (int) $_value;
+        if ($port < 1024 || $port > 65535) {
+            throw new Exception(__('Port de réception invalide : de 1024 à 65535', __FILE__));
+        }
+        return $port;
+    }
+
+    public static function preConfig_key($_value) {
+        $key = trim((string) $_value);
+        if ($key !== '' && strpos($key, 'crypt:') === false && !in_array(strlen($key), array(16, 24, 32))) {
+            throw new Exception(__('La clé de chiffrement doit compter 16, 24 ou 32 caractères', __FILE__));
+        }
+        return $key;
+    }
+
     public static function postConfig_port($_value)         { self::reloadDaemonConfig(); }
     public static function postConfig_udp($_value)          { self::reloadDaemonConfig(); }
     public static function postConfig_key($_value)          { self::reloadDaemonConfig(); }
@@ -215,7 +276,7 @@ class ajaxsiabe extends eqLogic {
     public static function postConfig_allowed($_value)      { self::reloadDaemonConfig(); }
     public static function postConfig_journal_days($_value) { self::reloadDaemonConfig(); }
 
-    /* État du démon pour la page : port ouvert, trames reçues, derniers émetteurs. */
+    /* État du démon pour la page : ports réellement ouverts, trames reçues. */
     public static function daemonStatus() {
         $answer = self::sendToDaemon(array('cmd' => 'status'));
         if (!is_array($answer) || $answer['state'] != 'ok') {
@@ -253,7 +314,24 @@ class ajaxsiabe extends eqLogic {
      * accusés au hub et consignés au journal. Il ne reste qu'à en tirer les états.
      */
     public static function handleMessages($_messages) {
+        /*
+         * Garde-fou : chaque message porte un identifiant unique, et un message
+         * déjà vu est ignoré, sans quoi une alarme déclencherait deux fois les
+         * scénarios. Le démon ne renvoie un lot que si Jeedom n'a pas pu être
+         * joint du tout, mais un mandataire ou une évolution du démon pourrait
+         * le rejouer.
+         */
+        $seen = cache::byKey('ajaxsiabe::seen')->getValue(array());
+        $seen = is_array($seen) ? $seen : array();
         foreach ($_messages as $message) {
+            $uid = isset($message['uid']) ? (string) $message['uid'] : '';
+            if ($uid !== '' && isset($seen[$uid])) {
+                log::add(__CLASS__, 'debug', __('Message déjà traité, ignoré :', __FILE__) . ' ' . $uid);
+                continue;
+            }
+            if ($uid !== '') {
+                $seen[$uid] = time();
+            }
             try {
                 self::handleMessage($message);
             } catch (Throwable $e) {
@@ -261,6 +339,11 @@ class ajaxsiabe extends eqLogic {
                        . $e->getMessage() . ' — ' . json_encode($message));
             }
         }
+        if (count($seen) > 500) {
+            arsort($seen);
+            $seen = array_slice($seen, 0, 500, true);
+        }
+        cache::set('ajaxsiabe::seen', $seen);
     }
 
     private static function handleMessage($_message) {
@@ -269,23 +352,65 @@ class ajaxsiabe extends eqLogic {
             log::add(__CLASS__, 'debug', __('Message sans numéro de compte ignoré', __FILE__));
             return;
         }
+        $encrypted = !empty($_message['enc']);
         $hub = self::hubByAccount($account);
+
+        /* Le démon refuse déjà le clair quand une clé est connue ; on le vérifie
+         * encore ici, parce que c'est ici qu'un désarmement prend effet. */
+        if (!$encrypted && (self::generalKey() !== '' || (is_object($hub) && $hub->hubKey() !== ''))) {
+            log::add(__CLASS__, 'warning', __('Message en clair ignoré pour un compte chiffré :', __FILE__) . ' ' . $account);
+            return;
+        }
+
         if (!is_object($hub)) {
             if (config::byKey('autocreate', __CLASS__, 1) != 1) {
                 log::add(__CLASS__, 'info', __('Message d\'un compte inconnu, non créé (création automatique désactivée) :', __FILE__) . ' ' . $account);
                 return;
             }
+            $auto = count(self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_HUB, 'autocreated' => 1)));
+            if ($auto >= self::AUTO_HUBS_MAX) {
+                log::add(__CLASS__, 'warning', __('Compte inconnu non créé : déjà', __FILE__) . ' ' . self::AUTO_HUBS_MAX . ' '
+                       . __('hubs créés automatiquement. Créez-le à la main s\'il est légitime :', __FILE__) . ' ' . $account);
+                return;
+            }
             $hub = self::createHub($account);
         }
         if ($hub->getIsEnable() != 1) {
+            log::add(__CLASS__, 'debug', $hub->getHumanName() . ' ' . __('désactivé : message ignoré', __FILE__));
             return;
         }
         $time = isset($_message['t']) ? (int) $_message['t'] : time();
-        $hub->touchContact($time, (isset($_message['type']) ? $_message['type'] : '') === 'NULL');
+        $type = isset($_message['type']) ? $_message['type'] : '';
+        $events = (isset($_message['events']) && is_array($_message['events'])) ? $_message['events'] : array();
+        $hub->touchContact($time, $type === 'NULL' || self::onlyTests($events));
 
-        foreach ((isset($_message['events']) && is_array($_message['events'])) ? $_message['events'] : array() as $event) {
-            $hub->applyEvent($event);
+        /* Un événement en échec ne doit pas emporter les suivants du même
+         * message : ce pourrait être l'alarme. */
+        foreach ($events as $event) {
+            try {
+                $hub->applyEvent($event);
+            } catch (Throwable $e) {
+                log::add(__CLASS__, 'error', $hub->getHumanName() . ' ' . __('événement non appliqué :', __FILE__) . ' '
+                       . $e->getMessage() . ' — ' . json_encode($event));
+            }
         }
+    }
+
+    /* Codes des tests automatiques, qui reviennent à intervalle fixe. Le test
+     * manuel (RX) n'en fait pas partie : c'est un geste de l'installateur. */
+    private static $_periodicCodes = array('RP', 'TX', 'YY');
+
+    /* Vrai si tous les événements sont des tests automatiques. */
+    private static function onlyTests($_events) {
+        if (empty($_events)) {
+            return false;
+        }
+        foreach ($_events as $event) {
+            if (!isset($event['code']) || !in_array($event['code'], self::$_periodicCodes)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public static function hubByAccount($_account) {
@@ -304,6 +429,7 @@ class ajaxsiabe extends eqLogic {
         $hub->setConfiguration('type', self::TYPE_HUB);
         $hub->setConfiguration('account', $_account);
         $hub->setConfiguration('autozone', 1);
+        $hub->setConfiguration('autocreated', 1);
         $hub->setIsEnable(1);
         $hub->setIsVisible(1);
         $hub->save();
@@ -312,15 +438,15 @@ class ajaxsiabe extends eqLogic {
     }
 
     /*
-     * Un nom libre pour un objet donné : le coeur refuse deux équipements de
-     * même nom sous le même objet, et l'enregistrement échouerait.
+     * Un nom libre sous un objet donné. L'unicité (nom, objet) vaut pour tous
+     * les équipements de Jeedom, pas seulement ceux du plugin : une « Zone 5 »
+     * d'un autre plugin ferait échouer l'enregistrement.
      */
     private static function freeName($_name, $_objectId) {
+        $objectId = ($_objectId === '' || $_objectId === null) ? null : $_objectId;
         $taken = array();
-        foreach (eqLogic::byType(__CLASS__) as $eqLogic) {
-            if ($eqLogic->getObject_id() == $_objectId) {
-                $taken[mb_strtolower($eqLogic->getName())] = true;
-            }
+        foreach (eqLogic::byObjectId($objectId, false) as $eqLogic) {
+            $taken[mb_strtolower($eqLogic->getName())] = true;
         }
         $name = $_name;
         for ($i = 2; isset($taken[mb_strtolower($name)]); $i++) {
@@ -332,13 +458,17 @@ class ajaxsiabe extends eqLogic {
     /* ---------------------------------------------------------- zones */
 
     public function zones() {
-        $zones = array();
-        foreach (self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_ZONE)) as $zone) {
-            if ((int) $zone->getConfiguration('hub_id') == (int) $this->getId()) {
-                $zones[(int) $zone->getConfiguration('zone')] = $zone;
+        $id = (int) $this->getId();
+        if (!isset(self::$_zoneCache[$id])) {
+            $zones = array();
+            foreach (self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_ZONE)) as $zone) {
+                if ((int) $zone->getConfiguration('hub_id') == $id) {
+                    $zones[(int) $zone->getConfiguration('zone')] = $zone;
+                }
             }
+            self::$_zoneCache[$id] = $zones;
         }
-        return $zones;
+        return self::$_zoneCache[$id];
     }
 
     public function zone($_number, $_create = false) {
@@ -346,19 +476,27 @@ class ajaxsiabe extends eqLogic {
         if (isset($zones[$_number])) {
             return $zones[$_number];
         }
-        if (!$_create || $this->getConfiguration('autozone', 1) != 1) {
+        if (!$_create || $this->getConfiguration('autozone', 1) != 1 || $_number < 1 || $_number > self::ZONE_MAX) {
             return null;
         }
-        $zone = new ajaxsiabe();
-        $zone->setEqType_name(__CLASS__);
-        $zone->setObject_id($this->getObject_id());
-        $zone->setName(self::freeName(__('Zone', __FILE__) . ' ' . $_number, $this->getObject_id()));
-        $zone->setConfiguration('type', self::TYPE_ZONE);
-        $zone->setConfiguration('hub_id', $this->getId());
-        $zone->setConfiguration('zone', $_number);
-        $zone->setIsEnable(1);
-        $zone->setIsVisible(1);
-        $zone->save();
+        /* Une zone qui ne peut pas être créée ne doit pas empêcher d'appliquer
+         * l'événement : l'alarme du hub compte plus que l'équipement de zone. */
+        try {
+            $zone = new ajaxsiabe();
+            $zone->setEqType_name(__CLASS__);
+            $zone->setObject_id($this->getObject_id());
+            $zone->setName(self::freeName(__('Zone', __FILE__) . ' ' . $_number, $this->getObject_id()));
+            $zone->setConfiguration('type', self::TYPE_ZONE);
+            $zone->setConfiguration('hub_id', $this->getId());
+            $zone->setConfiguration('zone', $_number);
+            $zone->setIsEnable(1);
+            $zone->setIsVisible(1);
+            $zone->save();
+        } catch (Throwable $e) {
+            log::add(__CLASS__, 'error', $this->getHumanName() . ' ' . __('zone', __FILE__) . ' ' . $_number . ' '
+                   . __('non créée :', __FILE__) . ' ' . $e->getMessage());
+            return null;
+        }
         log::add(__CLASS__, 'info', __('Nouvel appareil vu, équipement créé :', __FILE__) . ' ' . $zone->getHumanName()
                . ' — ' . __('renommez-le d\'après l\'appareil Ajax portant ce numéro', __FILE__));
         return $zone;
@@ -405,7 +543,7 @@ class ajaxsiabe extends eqLogic {
         $info = AjaxSiaCodec::describe(isset($_event['code']) ? $_event['code'] : '');
         $addr = isset($_event['addr']) ? trim($_event['addr']) : '';
         $subject = array('zone' => 0, 'user' => null, 'who' => '');
-        if (isset($_event['id']) && $_event['id'] !== '') {
+        if (isset($_event['id']) && $_event['id'] !== '' && ctype_digit((string) $_event['id'])) {
             $subject['user'] = (int) $_event['id'];
         } elseif ($info['a'] == 'u' && $addr !== '' && ctype_digit($addr)) {
             $subject['user'] = (int) $addr;
@@ -424,6 +562,10 @@ class ajaxsiabe extends eqLogic {
     /* Phrase affichée : « Armement par Jérôme », « Alarme intrusion — Porte d'entrée ». */
     public function describeEvent($_event) {
         $code = isset($_event['code']) ? $_event['code'] : '';
+        if ($code === '') {
+            return __('Événement Contact ID', __FILE__) . ' ' . (isset($_event['cid']) ? $_event['cid'] : '?')
+                 . ' (' . __('non répertorié', __FILE__) . ')';
+        }
         $info = AjaxSiaCodec::describe($code);
         $subject = $this->eventSubject($_event);
         $text = __($info['l'], __FILE__);
@@ -445,15 +587,15 @@ class ajaxsiabe extends eqLogic {
     /* ------------------------------------------------- états persistants */
 
     /*
-     * Les conditions en cours, par zone : alarmes, sabotages, batteries faibles,
-     * liaisons perdues. Le hub n'en montre que la synthèse (« au moins une »),
-     * qu'on ne peut pas reconstruire à partir de la seule dernière commande :
-     * un sabotage rétabli sur une zone ne dit rien des autres.
+     * Les conditions en cours : alarmes, sabotages, batteries faibles et
+     * liaisons perdues par zone, mode par groupe. Le hub n'en montre que la
+     * synthèse, qu'on ne peut pas reconstruire à partir de la seule dernière
+     * commande : un sabotage rétabli sur une zone ne dit rien des autres.
      */
     private function loadState() {
         $state = cache::byKey('ajaxsiabe::state::' . $this->getId())->getValue(null);
         $state = is_array($state) ? $state : array();
-        foreach (array('alarms', 'tamper', 'battery', 'link') as $key) {
+        foreach (array('alarms', 'tamper', 'battery', 'link', 'groups') as $key) {
             if (!isset($state[$key]) || !is_array($state[$key])) {
                 $state[$key] = array();
             }
@@ -465,32 +607,54 @@ class ajaxsiabe extends eqLogic {
         cache::set('ajaxsiabe::state::' . $this->getId(), $_state);
     }
 
+    /* Publie une valeur seulement si elle change : le coeur traite toujours une
+     * valeur vide comme un changement, et relancerait les scénarios. */
+    private function updateIfChanged($_logicalId, $_value) {
+        $cmd = $this->getCmd('info', $_logicalId);
+        if (is_object($cmd) && (string) $cmd->execCmd() === (string) $_value) {
+            return;
+        }
+        $this->checkAndUpdateCmd($_logicalId, $_value);
+    }
+
     /* ------------------------------------------------ application */
 
     /* Tout message, test de liaison compris, prouve que le hub est vivant. */
-    public function touchContact($_time, $_isNull = false) {
-        $previous = (int) cache::byKey('ajaxsiabe::contact::' . $this->getId())->getValue(0);
-        cache::set('ajaxsiabe::contact::' . $this->getId(), $_time);
-        if ($_isNull) {
-            /* Intervalle observé entre deux tests de liaison : c'est lui qui règle
-             * la supervision automatique, sans rien demander à l'utilisateur. */
-            $lastNull = (int) cache::byKey('ajaxsiabe::lastnull::' . $this->getId())->getValue(0);
-            if ($lastNull > 0 && $_time > $lastNull) {
-                cache::set('ajaxsiabe::nullinterval::' . $this->getId(), $_time - $lastNull);
+    public function touchContact($_time, $_isTest = false) {
+        $id = $this->getId();
+        $previous = (int) cache::byKey('ajaxsiabe::contact::' . $id)->getValue(0);
+        cache::set('ajaxsiabe::contact::' . $id, $_time);
+        if ($_isTest) {
+            /* Intervalles observés entre deux tests : ils règlent la supervision
+             * automatique. On en garde plusieurs et on retient la médiane ; un
+             * écart de moins de 30 s (test doublé sur deux canaux) est ignoré. */
+            $lastTest = (int) cache::byKey('ajaxsiabe::lasttest::' . $id)->getValue(0);
+            if ($lastTest > 0 && $_time - $lastTest >= 30) {
+                $intervals = cache::byKey('ajaxsiabe::intervals::' . $id)->getValue(array());
+                $intervals = is_array($intervals) ? $intervals : array();
+                $intervals[] = $_time - $lastTest;
+                cache::set('ajaxsiabe::intervals::' . $id, array_slice($intervals, -5));
             }
-            cache::set('ajaxsiabe::lastnull::' . $this->getId(), $_time);
+            if ($lastTest == 0 || $_time - $lastTest >= 30) {
+                cache::set('ajaxsiabe::lasttest::' . $id, $_time);
+            }
         }
         $this->checkAndUpdateCmd('last_contact', date('Y-m-d H:i:s', $_time));
         $link = $this->getCmd('info', 'link');
         if (is_object($link) && $link->execCmd() !== '' && (int) $link->execCmd() === 0 && $previous > 0) {
             log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . __('liaison rétablie', __FILE__));
         }
-        $this->checkAndUpdateCmd('link', 1);
+        $this->updateIfChanged('link', 1);
     }
 
     public function applyEvent($_event) {
         $code = isset($_event['code']) ? (string) $_event['code'] : '';
         if ($code === '') {
+            $label = $this->describeEvent($_event);
+            /* Code Contact ID absent de la table : publié tel quel plutôt que tu. */
+            log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . $label);
+            $this->checkAndUpdateCmd('last_code', 'CID' . (isset($_event['cid']) ? $_event['cid'] : ''));
+            $this->checkAndUpdateCmd('last_event', $label);
             return;
         }
         $info = AjaxSiaCodec::describe($code);
@@ -506,20 +670,15 @@ class ajaxsiabe extends eqLogic {
         log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . $code . ' : ' . $label);
 
         if (isset($effects['arm'])) {
-            $mode = $effects['arm'];
-            $this->checkAndUpdateCmd('arming', __(self::$_armingLabels[$mode], __FILE__));
-            $this->checkAndUpdateCmd('armed', ($mode == 'disarmed') ? 0 : 1);
-            if ($subject['who'] !== '') {
-                $this->checkAndUpdateCmd('arming_by', $subject['who']);
-            }
-            if ($mode == 'disarmed') {
-                $this->clearAlarms($state);
-            }
+            $this->applyArming($effects['arm'], $_event, $subject, $state);
         }
 
         if (isset($effects['alarm'])) {
             $type = __($effects['alarm'], __FILE__);
-            $state['alarms'][$zoneNumber] = array('type' => $type, 'latch' => !empty($effects['latch']) ? 1 : 0);
+            /* Une alarme déjà mémorisée pour cette zone garde sa mémoire. */
+            $latch = !empty($effects['latch']) || !empty($state['alarms'][$zoneNumber]['latch']);
+            unset($state['alarms'][$zoneNumber]);
+            $state['alarms'][$zoneNumber] = array('type' => $type, 'latch' => $latch ? 1 : 0);
             $this->checkAndUpdateCmd('alarm_type', $type);
             $this->checkAndUpdateCmd('alarm_zone', ($zoneNumber > 0) ? $this->zoneName($zoneNumber) : $this->getName());
             $this->checkAndUpdateCmd('alarm', 1);
@@ -537,14 +696,12 @@ class ajaxsiabe extends eqLogic {
              * gaz…) retombent avec leur détecteur. */
             if (isset($state['alarms'][$zoneNumber]) && empty($state['alarms'][$zoneNumber]['latch'])) {
                 unset($state['alarms'][$zoneNumber]);
-                if (empty($state['alarms'])) {
-                    $this->clearAlarms($state);
-                }
+                $this->publishAlarms($state);
             }
         }
 
         if (!empty($effects['cancel'])) {
-            $this->clearAlarms($state);
+            $this->clearAlarms($state, $effects['cancel']);
         }
 
         foreach (array('tamper' => 'tamper', 'battery' => 'battery_low') as $effect => $logicalId) {
@@ -559,24 +716,27 @@ class ajaxsiabe extends eqLogic {
             if (is_object($zone)) {
                 $zone->checkAndUpdateCmd($logicalId, $effects[$effect] ? 1 : 0);
             }
-            $this->checkAndUpdateCmd($logicalId, empty($state[$effect]) ? 0 : 1);
+            $this->updateIfChanged($logicalId, empty($state[$effect]) ? 0 : 1);
         }
 
-        if (isset($effects['link']) && $zoneNumber > 0) {
-            if ($effects['link']) {
+        if ($zoneNumber > 0) {
+            /* Un appareil qui parle est un appareil joignable : tout événement de
+             * la zone rétablit sa liaison, sauf celui qui annonce sa perte. */
+            $linkUp = !isset($effects['link']) || $effects['link'];
+            if ($linkUp) {
                 unset($state['link'][$zoneNumber]);
             } else {
                 $state['link'][$zoneNumber] = 1;
             }
             if (is_object($zone)) {
-                $zone->checkAndUpdateCmd('link', $effects['link'] ? 1 : 0);
+                $zone->updateIfChanged('link', $linkUp ? 1 : 0);
             }
         }
         if (isset($effects['power'])) {
-            $this->checkAndUpdateCmd('power', $effects['power'] ? 1 : 0);
+            $this->updateIfChanged('power', $effects['power'] ? 1 : 0);
         }
         if (isset($effects['jamming'])) {
-            $this->checkAndUpdateCmd('jamming', $effects['jamming'] ? 1 : 0);
+            $this->updateIfChanged('jamming', $effects['jamming'] ? 1 : 0);
         }
 
         $this->saveState($state);
@@ -587,58 +747,182 @@ class ajaxsiabe extends eqLogic {
         }
     }
 
-    /* Fin de toutes les alarmes : désarmement, annulation ou acquittement. */
-    private function clearAlarms(&$_state) {
-        $zones = $this->zones();
-        foreach (array_keys($_state['alarms']) as $number) {
-            if (isset($zones[$number])) {
-                $zones[$number]->checkAndUpdateCmd('alarm', 0);
+    /*
+     * Mode d'armement.
+     *
+     * Sans groupes déclarés sur le hub, le numéro de groupe transmis (« ri »)
+     * est ignoré : tout événement vaut pour le système entier. Un hub Ajax sans
+     * mode groupes envoie un ri quelconque, qui ne doit rien changer.
+     *
+     * Avec des groupes déclarés, chacun a son mode et celui du hub en est la
+     * synthèse : tous armés → Armé, tous désarmés → Désarmé, un mélange →
+     * Armé partiel. Un groupe déclaré mais jamais signalé prend le dernier
+     * mode du système entier. Désarmer le garage ne désarme pas la maison, ni
+     * n'efface une intrusion en cours dans la maison.
+     */
+    private function applyArming($_mode, $_event, $_subject, &$_state) {
+        $declared = array_keys($this->numberedNames('groups'));
+        $group = 0;
+        if (!empty($declared)) {
+            if (isset($_event['ri']) && $_event['ri'] !== '' && (int) $_event['ri'] > 0) {
+                $group = (int) $_event['ri'];
+            } else {
+                /* Certains codes de groupe (CG, OG, CA…) portent le numéro de
+                 * groupe dans leur adresse plutôt que dans « ri ». */
+                $info = AjaxSiaCodec::describe(isset($_event['code']) ? $_event['code'] : '');
+                $addr = isset($_event['addr']) ? trim($_event['addr']) : '';
+                if ($info['a'] == 'g' && $addr !== '' && ctype_digit($addr) && (int) $addr > 0) {
+                    $group = (int) $addr;
+                }
             }
         }
-        $_state['alarms'] = array();
-        $this->checkAndUpdateCmd('alarm', 0);
-        $this->checkAndUpdateCmd('alarm_type', '');
-        $this->checkAndUpdateCmd('alarm_zone', '');
+        if ($group == 0) {
+            $_state['groups'] = array('0' => $_mode);
+        } else {
+            $_state['groups'][(string) $group] = $_mode;
+        }
+        if (empty($declared)) {
+            $global = $_mode;
+        } else {
+            $whole = isset($_state['groups']['0']) ? $_state['groups']['0'] : null;
+            $modes = array();
+            foreach ($declared as $number) {
+                if (isset($_state['groups'][(string) $number])) {
+                    $modes[] = $_state['groups'][(string) $number];
+                } elseif ($whole !== null) {
+                    $modes[] = $whole;
+                }
+            }
+            if ($group != 0 && !in_array($group, $declared)) {
+                $modes[] = $_mode;            // groupe non déclaré : compté quand même
+            }
+            $modes = array_values(array_unique($modes));
+            $global = (count($modes) == 1) ? $modes[0] : 'partial';
+        }
+        $this->checkAndUpdateCmd('arming', __(self::$_armingLabels[$global], __FILE__));
+        $this->checkAndUpdateCmd('armed', ($global == 'disarmed') ? 0 : 1);
+
+        $who = $_subject['who'];
+        if ($who === '' && $group > 0) {
+            $who = $this->groupName($group);
+        }
+        if ($who === '') {
+            $who = __('le système', __FILE__);
+        }
+        $this->checkAndUpdateCmd('arming_by', $who);
+
+        /* Le désarmement complet efface les alarmes mémorisées (intrusion,
+         * panique…). Les alarmes techniques restent tant que leur détecteur
+         * n'est pas revenu au repos : désarmer n'éteint pas un incendie. */
+        if ($global == 'disarmed') {
+            $this->clearAlarms($_state, 'latched');
+        }
+    }
+
+    /*
+     * Retire des alarmes en cours : 'latched' les alarmes mémorisées, un type
+     * (« Intrusion », « Incendie ») celles de ce type, 'all' toutes.
+     */
+    private function clearAlarms(&$_state, $_filter = 'all') {
+        $zones = $this->zones();
+        foreach ($_state['alarms'] as $number => $alarm) {
+            $match = ($_filter == 'all')
+                  || ($_filter == 'latched' && !empty($alarm['latch']))
+                  || ($alarm['type'] === __($_filter, __FILE__));
+            if (!$match) {
+                continue;
+            }
+            unset($_state['alarms'][$number]);
+            if (isset($zones[$number])) {
+                $zones[$number]->updateIfChanged('alarm', 0);
+            }
+        }
+        $this->publishAlarms($_state);
+    }
+
+    /* Commandes d'alarme du hub d'après ce qui reste en cours : la dernière
+     * alarme encore active donne le type et l'origine. */
+    private function publishAlarms($_state) {
+        if (empty($_state['alarms'])) {
+            $this->updateIfChanged('alarm', 0);
+            $this->updateIfChanged('alarm_type', '');
+            $this->updateIfChanged('alarm_zone', '');
+            return;
+        }
+        $numbers = array_keys($_state['alarms']);
+        $last = end($numbers);
+        $this->updateIfChanged('alarm_type', $_state['alarms'][$last]['type']);
+        $this->updateIfChanged('alarm_zone', ($last > 0) ? $this->zoneName($last) : $this->getName());
     }
 
     public function resetAlarm() {
         $state = $this->loadState();
-        $this->clearAlarms($state);
+        $this->clearAlarms($state, 'all');
         $this->saveState($state);
         log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . __('alarme acquittée depuis Jeedom', __FILE__));
+    }
+
+    /* Une zone supprimée n'enverra plus de rétablissement : ses conditions en
+     * cours sont retirées de la synthèse du hub. */
+    private function forgetZone($_number) {
+        $state = $this->loadState();
+        foreach (array('tamper' => 'tamper', 'battery' => 'battery_low') as $key => $logicalId) {
+            unset($state[$key][$_number]);
+            $this->updateIfChanged($logicalId, empty($state[$key]) ? 0 : 1);
+        }
+        unset($state['link'][$_number]);
+        if (isset($state['alarms'][$_number])) {
+            unset($state['alarms'][$_number]);
+            $this->publishAlarms($state);
+        }
+        $this->saveState($state);
     }
 
     /* ------------------------------------------------------ supervision */
 
     /*
      * Délai au-delà duquel un hub muet est déclaré perdu, en secondes. Réglé à
-     * la main sur le hub, sinon déduit de l'intervalle observé entre deux tests
-     * de liaison. 0 : pas encore assez d'observations, pas de supervision.
+     * la main sur le hub, sinon déduit de la médiane des intervalles observés
+     * entre deux tests. 0 : pas encore de mesure, pas de supervision.
      */
     public function supervisionDelay() {
         $manual = (int) $this->getConfiguration('supervision', 0);
         if ($manual > 0) {
             return $manual * 60;
         }
-        $interval = (int) cache::byKey('ajaxsiabe::nullinterval::' . $this->getId())->getValue(0);
-        if ($interval <= 0) {
+        $intervals = cache::byKey('ajaxsiabe::intervals::' . $this->getId())->getValue(array());
+        if (!is_array($intervals) || empty($intervals)) {
             return 0;
         }
+        sort($intervals);
+        $median = $intervals[(int) floor(count($intervals) / 2)];
         /* Deux tests et demi manqués, et jamais moins de trois minutes : un
          * message peut arriver en retard sans que la liaison soit en cause. */
-        return max(180, (int) round($interval * 2.5) + 30);
+        return max(180, (int) round($median * 2.5) + 30);
     }
 
     public static function cron() {
+        /* Démon arrêté : c'est le récepteur qui est sourd, pas le hub qui s'est
+         * tu. Accuser le hub déclencherait de fausses alertes. */
+        if (self::deamon_info()['state'] != 'ok') {
+            return;
+        }
+        $daemonStart = (int) cache::byKey('ajaxsiabe::daemonStart')->getValue(0);
         foreach (self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_HUB), true) as $hub) {
             try {
                 $delay = $hub->supervisionDelay();
-                $last = (int) cache::byKey('ajaxsiabe::contact::' . $hub->getId())->getValue(0);
-                if ($delay <= 0 || $last <= 0 || time() - $last <= $delay) {
+                if ($delay <= 0) {
+                    continue;
+                }
+                /* Référence : le dernier message, mais jamais avant le démarrage
+                 * du démon. Après un arrêt de Jeedom, le hub a le temps de se
+                 * manifester ; un hub jamais entendu depuis finit signalé. */
+                $last = max((int) cache::byKey('ajaxsiabe::contact::' . $hub->getId())->getValue(0), $daemonStart);
+                if ($last <= 0 || time() - $last <= $delay) {
                     continue;
                 }
                 $link = $hub->getCmd('info', 'link');
-                if (is_object($link) && (int) $link->execCmd() === 1) {
+                if (is_object($link) && (string) $link->execCmd() !== '0') {
                     log::add(__CLASS__, 'warning', $hub->getHumanName() . ' ' . __('muet depuis', __FILE__) . ' '
                            . round((time() - $last) / 60) . ' min : ' . __('liaison déclarée perdue', __FILE__));
                     $hub->checkAndUpdateCmd('link', 0);
@@ -671,17 +955,19 @@ class ajaxsiabe extends eqLogic {
     /*
      * Les trames d'une journée, de la plus récente à la plus ancienne, avec les
      * noms résolus au moment de la lecture : renommer une zone éclaire aussi
-     * les événements passés.
+     * les événements passés. Date vide : aujourd'hui, selon l'horloge de Jeedom.
      *
-     * Filtres : 'account', 'tests' (0 masque tests de liaison et tests
-     * périodiques), 'problems' (1 ne garde que les refus), 'search', 'limit'.
+     * Filtres : 'account', 'tests' (0 masque les tests de liaison et les tests
+     * périodiques, qui sont comptés à part), 'problems' (1 ne garde que les
+     * refus), 'search', 'limit'.
      */
     public static function readJournal($_date, $_filters = array()) {
-        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $_date)) {
+        $date = ($_date === '' || $_date === null) ? date('Y-m-d') : $_date;
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
             throw new Exception(__('Date invalide', __FILE__));
         }
-        $file = self::journalDir() . '/' . $_date . '.jsonl';
-        $result = array('date' => $_date, 'entries' => array(), 'total' => 0, 'truncated' => false);
+        $file = self::journalDir() . '/' . $date . '.jsonl';
+        $result = array('date' => $date, 'entries' => array(), 'total' => 0, 'hiddenTests' => 0, 'truncated' => false);
         if (!is_readable($file)) {
             return $result;
         }
@@ -693,7 +979,10 @@ class ajaxsiabe extends eqLogic {
 
         $hubs = array();
         foreach (self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_HUB)) as $hub) {
-            $hubs[strtoupper((string) $hub->getConfiguration('account'))] = $hub;
+            $hubAccount = strtoupper((string) $hub->getConfiguration('account'));
+            if ($hubAccount !== '') {
+                $hubs[$hubAccount] = $hub;
+            }
         }
 
         $lines = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
@@ -702,17 +991,18 @@ class ajaxsiabe extends eqLogic {
             if (!is_array($entry)) {
                 continue;
             }
-            $entry += array('status' => '', 'type' => '', 'account' => '', 'events' => array(), 'error' => '');
+            $entry += array('status' => '', 'type' => '', 'account' => '', 'events' => array(), 'error' => '', 'peer' => '', 'warning' => '');
             if ($account !== '' && $entry['account'] !== $account) {
                 continue;
             }
             if ($problems && in_array($entry['status'], array('ok', 'duplicate'))) {
                 continue;
             }
-            if (!$tests && $entry['status'] == 'ok' && self::isTestOnly($entry)) {
+            if (!$tests && in_array($entry['status'], array('ok', 'duplicate')) && self::isPeriodicTest($entry)) {
+                $result['hiddenTests']++;
                 continue;
             }
-            $hub = isset($hubs[$entry['account']]) ? $hubs[$entry['account']] : null;
+            $hub = ($entry['account'] !== '' && isset($hubs[$entry['account']])) ? $hubs[$entry['account']] : null;
             $entry['hub'] = is_object($hub) ? $hub->getName() : '';
             $texts = array();
             foreach ($entry['events'] as $event) {
@@ -722,8 +1012,13 @@ class ajaxsiabe extends eqLogic {
                 $texts[] = __('Test de liaison', __FILE__);
             }
             $entry['text'] = implode(' · ', $texts);
-            if ($search !== '' && mb_strpos(mb_strtolower($entry['text'] . ' ' . (isset($entry['data']) ? $entry['data'] : '') . ' ' . $entry['hub'] . ' ' . $entry['account']), $search) === false) {
-                continue;
+            $entry['time'] = isset($entry['t']) ? date('H:i:s', (int) $entry['t']) : '';
+            if ($search !== '') {
+                $haystack = mb_strtolower($entry['text'] . ' ' . (isset($entry['data']) ? $entry['data'] : '') . ' ' . $entry['hub'] . ' '
+                          . $entry['account'] . ' ' . $entry['error'] . ' ' . $entry['warning'] . ' ' . $entry['peer']);
+                if (mb_strpos($haystack, $search) === false) {
+                    continue;
+                }
             }
             $result['total']++;
             if (count($result['entries']) < $limit) {
@@ -735,21 +1030,14 @@ class ajaxsiabe extends eqLogic {
         return $result;
     }
 
-    /* Message qui ne porte qu'un test de liaison ou un test périodique. */
-    private static function isTestOnly($_entry) {
+    /* Test de liaison (NULL) ou test périodique automatique (RP) : ce qui
+     * revient toutes les minutes. Un test manuel (RX) reste visible, c'est un
+     * geste de l'installateur. */
+    private static function isPeriodicTest($_entry) {
         if ($_entry['type'] == 'NULL') {
             return true;
         }
-        if (empty($_entry['events'])) {
-            return false;
-        }
-        foreach ($_entry['events'] as $event) {
-            $info = AjaxSiaCodec::describe(isset($event['code']) ? $event['code'] : '');
-            if (empty($info['e']['test'])) {
-                return false;
-            }
-        }
-        return true;
+        return self::onlyTests($_entry['events']);
     }
 
     /* ================================================== CYCLE DE VIE */
@@ -758,6 +1046,14 @@ class ajaxsiabe extends eqLogic {
         if (!in_array($this->getConfiguration('type'), array(self::TYPE_HUB, self::TYPE_ZONE))) {
             $this->setConfiguration('type', self::TYPE_HUB);
         }
+        /* Un hub qui a des appareils ne peut pas devenir un appareil : ses zones
+         * perdraient leur hub et le compte serait recréé au message suivant. */
+        if ($this->getId() != '' && $this->getConfiguration('type') == self::TYPE_ZONE) {
+            $stored = self::byId($this->getId());
+            if (is_object($stored) && $stored->getConfiguration('type') == self::TYPE_HUB && count($stored->zones()) > 0) {
+                throw new Exception(__('Ce hub a des appareils : il ne peut pas devenir un appareil.', __FILE__));
+            }
+        }
         if ($this->getConfiguration('type') == self::TYPE_HUB) {
             $account = strtoupper(trim((string) $this->getConfiguration('account')));
             if ($account !== '' && !preg_match('/^[0-9A-F]{1,16}$/', $account)) {
@@ -765,8 +1061,11 @@ class ajaxsiabe extends eqLogic {
             }
             $this->setConfiguration('account', $account);
             $key = trim((string) $this->getConfiguration('key'));
-            if ($key !== '' && !in_array(strlen($key), array(16, 24, 32))) {
-                throw new Exception(__('La clé de chiffrement doit compter 16, 24 ou 32 caractères', __FILE__));
+            if ($key !== '' && strpos($key, 'crypt:') === false) {
+                if (!in_array(strlen($key), array(16, 24, 32))) {
+                    throw new Exception(__('La clé de chiffrement doit compter 16, 24 ou 32 caractères', __FILE__));
+                }
+                $key = utils::encrypt($key);
             }
             $this->setConfiguration('key', $key);
             if ($account !== '') {
@@ -777,24 +1076,54 @@ class ajaxsiabe extends eqLogic {
             }
             $this->setLogicalId($account);
         } else {
-            $this->setLogicalId('zone::' . (int) $this->getConfiguration('hub_id') . '::' . (int) $this->getConfiguration('zone'));
+            $hubId = (int) $this->getConfiguration('hub_id');
+            $number = (int) $this->getConfiguration('zone');
+            if ($this->getId() != '' && $hubId > 0 && $number > 0) {
+                foreach (self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_ZONE)) as $other) {
+                    if ($other->getId() != $this->getId() && (int) $other->getConfiguration('hub_id') == $hubId
+                     && (int) $other->getConfiguration('zone') == $number) {
+                        throw new Exception(__('Ce numéro de zone est déjà celui de', __FILE__) . ' ' . $other->getHumanName());
+                    }
+                }
+            }
+            $this->setLogicalId('zone::' . $hubId . '::' . $number);
         }
     }
 
     public function postSave() {
+        self::$_zoneCache = array();
         $definitions = ($this->getConfiguration('type') == self::TYPE_ZONE) ? self::$_zoneCommands : self::$_hubCommands;
+        $wanted = array();
         $order = 0;
         foreach ($definitions as $definition) {
-            $this->addCmdIfMissing($definition, $order++);
+            $wanted[$definition['logicalId']] = true;
+            $cmd = $this->addCmdIfMissing($definition, $order++);
+            /* Valeur de départ des états. Posée à chaque enregistrement tant que la
+             * commande est vide : un hub créé à la main l'est d'abord désactivé, et
+             * le coeur ignore toute mise à jour d'un équipement désactivé. */
+            if (isset($definition['initial']) && $this->getIsEnable() == 1 && $cmd->execCmd() === '') {
+                $this->checkAndUpdateCmd($cmd, $definition['initial']);
+            }
         }
-        if ($this->getConfiguration('type') == self::TYPE_HUB) {
-            self::reloadDaemonConfig();
+        /* Commandes de l'autre type, laissées par un changement de type. */
+        foreach ($this->getCmd() as $cmd) {
+            if (!isset($wanted[$cmd->getLogicalId()])) {
+                $cmd->remove();
+            }
         }
+        /* Toujours, et pas seulement pour un hub : un hub devenu zone doit
+         * sortir de la configuration du démon, avec sa clé. */
+        self::reloadDaemonConfig();
     }
+
+    /* Hub en cours de suppression : ses zones partent avec lui sans rien
+     * republier sur lui, ce qui déclencherait des scénarios pour rien. */
+    private static $_removingHub = 0;
 
     /* Les appareils n'existent que par leur hub : ils partent avec lui. */
     public function preRemove() {
         if ($this->getConfiguration('type') == self::TYPE_HUB) {
+            self::$_removingHub = (int) $this->getId();
             foreach ($this->zones() as $zone) {
                 $zone->remove();
             }
@@ -802,10 +1131,18 @@ class ajaxsiabe extends eqLogic {
     }
 
     public function postRemove() {
-        cache::delete('ajaxsiabe::state::' . $this->getId());
-        cache::delete('ajaxsiabe::contact::' . $this->getId());
-        cache::delete('ajaxsiabe::lastnull::' . $this->getId());
-        cache::delete('ajaxsiabe::nullinterval::' . $this->getId());
+        self::$_zoneCache = array();
+        if ($this->getConfiguration('type') == self::TYPE_ZONE) {
+            $hubId = (int) $this->getConfiguration('hub_id');
+            $hub = ($hubId == self::$_removingHub) ? null : self::byId($hubId);
+            if (is_object($hub) && $hub->getEqType_name() == __CLASS__) {
+                $hub->forgetZone((int) $this->getConfiguration('zone'));
+            }
+            return;
+        }
+        foreach (array('state', 'contact', 'lasttest', 'intervals') as $key) {
+            cache::delete('ajaxsiabe::' . $key . '::' . $this->getId());
+        }
         self::reloadDaemonConfig();
     }
 
@@ -836,17 +1173,10 @@ class ajaxsiabe extends eqLogic {
         if (!empty($_definition['invert'])) {
             $cmd->setDisplay('invertBinary', 1);
         }
-        /* Deux armements de suite par la même personne sont deux événements : un
-         * scénario déclenché sur cette commande doit voir le second. */
         if (!empty($_definition['repeat'])) {
             $cmd->setConfiguration('repeatEventManagement', 'always');
         }
         $cmd->save();
-        /* Valeur de départ des états : sans elle, un hub tout juste découvert
-         * afficherait « sabotage » ou « secteur coupé » faute de valeur. */
-        if (isset($_definition['initial'])) {
-            $this->checkAndUpdateCmd($cmd, $_definition['initial']);
-        }
         return $cmd;
     }
 }

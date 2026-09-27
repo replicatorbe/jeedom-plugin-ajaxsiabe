@@ -35,8 +35,10 @@ l'adresse privée de Jeedom. La supervision de la liaison le signale.
 1. Installez le plugin, activez-le, puis démarrez le démon s'il ne démarre pas
    seul.
 2. Dans la configuration du plugin, choisissez le **port de réception**
-   (7777 par défaut). Si vous activez le chiffrement côté Ajax, saisissez la
-   même **clé de chiffrement**.
+   (7777 par défaut, en TCP ; l'UDP est désactivé par défaut, les hubs Ajax
+   n'en ont pas besoin). Si vous activez le chiffrement côté Ajax, saisissez
+   la même **clé de chiffrement** : dès lors, tout message en clair est
+   refusé.
 3. Dans l'application **Ajax PRO** (gratuite), ouvrez Hub → Paramètres →
    **Centre de télésurveillance** et réglez :
    - Protocole : **SIA DC-09 (SIA-DCS)**. Contact ID (ADM-CID) est aussi pris
@@ -47,8 +49,10 @@ l'adresse privée de Jeedom. La supervision de la liaison le signale.
    - **Chiffrement** : recommandé, avec une clé de 16, 24 ou 32 caractères ;
    - **Intervalle de test (ping)** : court, de 1 à 5 minutes. C'est lui qui
      règle la supervision de la liaison.
-4. Le hub apparaît dans le plugin dès son premier message. Chaque appareil
-   apparaît ensuite au premier événement qui le concerne.
+4. Le hub apparaît dans le plugin dès son premier message (rechargez la
+   page). Chaque appareil apparaît ensuite au premier événement qui le
+   concerne. La création automatique s'arrête à cinq hubs et aux numéros
+   d'appareil de 1 à 999 ; au-delà, créez l'équipement à la main.
 
 La page du plugin affiche en permanence l'état du récepteur : port ouvert,
 nombre de trames reçues, heure du dernier message de chaque hub.
@@ -62,19 +66,19 @@ le créer à la main avant de configurer Ajax.
 
 | Réglage | Rôle |
 |---|---|
-| Numéro de compte | Le numéro d'objet saisi dans Ajax PRO. |
-| Clé de chiffrement | La clé propre à ce hub. Vide, c'est la clé générale du plugin qui sert. |
-| Liaison perdue après | En minutes. Vide : le délai est déduit de l'intervalle mesuré entre deux tests de liaison. Le hub est déclaré perdu après deux tests et demi manqués, et jamais avant trois minutes. |
+| Numéro de compte | Le numéro d'objet saisi dans Ajax PRO (3 à 16 caractères hexadécimaux selon la norme ; Jeedom en accepte de 1 à 16). |
+| Clé de chiffrement | La clé propre à ce hub, stockée chiffrée. Vide, c'est la clé générale du plugin qui sert. |
+| Liaison perdue après | En minutes. Vide : le délai vaut 2,5 fois l'intervalle médian mesuré entre les tests de liaison, plus 30 s, et jamais moins de trois minutes. Aucune perte n'est déclarée tant que le démon est arrêté : c'est alors le récepteur qui est sourd, pas le hub. |
 | Créer les appareils | Crée une zone au premier événement d'un appareil. |
 | Utilisateurs | Une ligne par utilisateur : `numéro=nom`. Exemple : `1=Jérôme`. Le journal montre le numéro transmis à chaque armement. |
-| Groupes | En mode groupes : `numéro=nom`. |
+| Groupes | En mode groupes seulement : `numéro=nom`, un par ligne. Déclarer les groupes active le suivi du mode groupe par groupe ; sans groupe déclaré, tout armement vaut pour le système entier. |
 
 | Commande | Contenu |
 |---|---|
-| Mode | `Désarmé`, `Armé`, `Mode nuit` ou `Armé partiel`. |
-| Armée | 1 si le système est armé ou en mode nuit. |
-| Mode changé par | Nom de l'utilisateur ou de l'appareil. |
-| Alarme | 1 tant qu'une alarme est en cours. |
+| Mode | `Désarmé`, `Armé`, `Mode nuit` ou `Armé partiel`. Vide tant qu'aucun changement de mode n'a été reçu. Si des groupes sont déclarés sur le hub, c'est la synthèse des groupes : tous armés → Armé, tous désarmés → Désarmé, un mélange → Armé partiel. |
+| Armée | 1 si le système est armé, partiellement armé ou en mode nuit. |
+| Mode changé par | Nom de l'utilisateur ou de l'appareil ; à défaut le nom du groupe, ou « le système » pour un changement automatique. |
+| Alarme | 1 tant qu'une alarme est en cours. Chaque nouvelle alarme redéclenche les scénarios, même si une autre était déjà en cours. |
 | Type d'alarme | Intrusion, Incendie, Inondation, Gaz, Panique… |
 | Origine de l'alarme | Nom de la zone qui a déclenché. |
 | Acquitter l'alarme | Remet l'alarme à zéro côté Jeedom. |
@@ -87,10 +91,22 @@ le créer à la main avant de configurer Ajax.
 | Dernier événement | L'événement en toutes lettres, par exemple « Armement par Jérôme ». |
 | Dernier code SIA | Le code brut, par exemple `CL`. |
 
-**Fin d'une alarme.** Une alarme d'intrusion, de panique ou d'agression reste
-active jusqu'au désarmement, à l'annulation ou à l'acquittement : qu'une porte
-se referme ne prouve pas que l'intrus est reparti. Une alarme technique
-(incendie, eau, gaz, gel) retombe quand son détecteur revient au repos.
+**Fin d'une alarme.**
+
+- Les alarmes d'intrusion, de porte forcée, de sortie, de panique,
+  d'agression, de contrainte, médicale et d'urgence restent actives jusqu'au
+  désarmement complet, à leur annulation ou à l'acquittement : qu'une porte
+  se referme ne prouve pas que l'intrus est reparti. Reçues en mode désarmé,
+  elles restent aussi actives jusqu'au désarmement suivant ou à
+  l'acquittement.
+- Les alarmes techniques (incendie, chaleur, eau, gaz, gel, sprinkler)
+  retombent quand leur détecteur revient au repos. Désarmer ne les efface
+  pas : désarmer n'éteint pas un incendie.
+- Désarmer un seul groupe n'efface rien.
+- Sur une zone, « Alarme » repasse à 0 dès que le détecteur revient au
+  repos ; c'est le hub qui garde la mémoire.
+- Quand plusieurs alarmes sont en cours, « Type d'alarme » et « Origine de
+  l'alarme » montrent la plus récente encore active.
 
 **Nouvel événement.** « Dernier événement » et « Dernier code SIA »
 déclenchent les scénarios même quand la valeur ne change pas. Deux armements
@@ -103,16 +119,26 @@ Elle est créée sous le nom « Zone N ». **Renommez-la d'après l'appareil** :
 son nom sert ensuite dans les événements et dans « Origine de l'alarme ».
 
 Commandes : Alarme, Sabotage, Batterie faible, Liaison, Dernier événement.
+Tout événement venu de l'appareil remet sa liaison à 1, sauf celui qui en
+annonce la perte.
+
+Supprimer une zone retire ses sabotages et batteries faibles en cours de la
+synthèse du hub. Supprimer un hub supprime ses zones ; il sera recréé à son
+prochain message si la création automatique est active.
 
 ## Journal SIA
 
 Le journal garde chaque trame reçue, lue en clair : acceptée, en double ou
-refusée, test de liaison compris. Il est conservé 90 jours par défaut.
+refusée, test de liaison compris. Il est conservé 90 jours par défaut, dans
+la limite de 50 Mo par jour, et exclu des sauvegardes de Jeedom. Les tests
+de liaison automatiques sont masqués par défaut ; leur nombre s'affiche à
+côté du compteur. Les refus répétés d'un même émetteur (bruit, adresse non
+autorisée) sont résumés une fois par minute.
 
 C'est l'outil pour mettre le raccordement au point et pour savoir ce que le
 hub envoie :
 
-- cochez **Suivi en direct** ;
+- laissez **Suivi en direct** coché, sur « Aujourd'hui » ;
 - faites un geste sur le système : armer, désarmer, ouvrir une porte armée,
   ouvrir un boîtier ;
 - la ligne apparaît. Cliquez dessus pour voir la trame brute, son contenu
@@ -122,9 +148,11 @@ Motifs de refus :
 
 | Statut | Signification |
 |---|---|
+| En clair | Message non chiffré pour un compte dont la clé est connue : refusé, sans réponse. C'est ce qui empêche une machine du réseau de simuler un désarmement. |
 | Clé fausse | Message chiffré que ni la clé du hub ni la clé générale ne déchiffrent. |
+| Sans heure | Message chiffré sans horodatage, que la norme interdit. |
 | Mal daté | Message chiffré daté de plus de 40 s dans le passé ou de 20 s dans le futur. La norme l'impose pour empêcher le rejeu d'une trame capturée. Le refus donne l'heure au hub, qui se recale et renvoie son message. |
-| CRC faux, Longueur fausse, Illisible | Trame abîmée ou qui n'est pas du SIA DC-09. |
+| CRC faux, Illisible | Trame abîmée ou qui n'est pas du SIA DC-09. Une connexion qui en envoie cinq de suite est fermée. Une longueur annoncée fausse avec un CRC juste est acceptée et signalée par une icône. |
 | Refusé | Adresse absente de la liste des adresses autorisées. |
 | Doublon | Message réémis par le hub. Il reçoit un accusé de réception mais n'est traité qu'une fois. |
 
@@ -142,8 +170,11 @@ Motifs de refus :
 ## Sécurité
 
 - Le port de réception n'a aucune raison d'être ouvert vers Internet.
-- Activez le chiffrement dans Ajax PRO. Sans lui, n'importe quel appareil du
-  réseau local peut envoyer un faux message à Jeedom.
+- Activez le chiffrement dans Ajax PRO et saisissez la clé dans Jeedom. Sans
+  clé, n'importe quel appareil du réseau local peut envoyer un faux message
+  à Jeedom. Avec une clé, les messages en clair sont refusés.
 - Renseignez la liste des **adresses autorisées** avec l'adresse IP du hub.
-- Le journal contient les messages déchiffrés. Il n'est lisible que par un
-  administrateur.
+- Le journal contient les messages déchiffrés. La page n'est lisible que par
+  un administrateur, et le dossier `data/` est protégé par un `.htaccess`.
+  Sous un autre serveur web qu'Apache (nginx), interdisez l'accès à
+  `plugins/ajaxsiabe/data/`.

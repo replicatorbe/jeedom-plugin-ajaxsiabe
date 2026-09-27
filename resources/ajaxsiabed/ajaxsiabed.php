@@ -6,16 +6,17 @@
  * événements en TCP (ou UDP), il les accuse aussitôt, les consigne dans le
  * journal puis les remet à Jeedom.
  *
- * L'ordre compte. L'accusé de réception part AVANT toute écriture et tout appel
- * à Jeedom : le hub attend quelques secondes puis réémet, et un Jeedom lent ne
- * doit jamais lui faire croire que le centre est tombé. Le journal est écrit
- * ensuite, par le démon lui-même : un événement reçu y figure même si Jeedom
- * ne répond pas, et même s'il a été refusé.
+ * L'accusé de réception ne dépend jamais de Jeedom : il part dès que la
+ * trame est lue et consignée au journal, la remise à Jeedom se faisant dans un
+ * processus fils. Le hub attend quelques secondes puis réémet, et un Jeedom
+ * lent ne doit jamais lui faire croire que le centre est tombé. Le journal est
+ * écrit par le démon lui-même : un événement reçu y figure même si Jeedom ne
+ * répond pas, et même s'il a été refusé.
  *
  * Processus autonome : il ne charge PAS le coeur de Jeedom. Sa configuration
  * est lue sur le callback HTTP du plugin, et les événements y sont repoussés.
  *
- * This file is part of Jeedom. Licensed under GNU GPL v3 or later.
+ * Licence AGPL v3, comme le reste du plugin.
  */
 
 /* ---------------------------------------------------------------- garde CLI ---
@@ -75,14 +76,29 @@ SiaLog::setLevel(isset($opt['loglevel']) ? $opt['loglevel'] : 'error');
  * ========================================================================== */
 class AjaxSiaDaemon {
 
-    const PUSH_TIMEOUT   = 4;        // un Jeedom lent ne doit jamais geler la boucle
-    const PUSH_ATTEMPTS  = 2;
+    /* Remise à Jeedom. Délai large : le premier message d'un hub crée des
+     * équipements, ce qui prend du temps sur un petit matériel. Une seule
+     * nouvelle tentative, et seulement si Jeedom n'a pas été joint du tout :
+     * relancer un envoi qui a expiré le ferait traiter deux fois. */
+    const PUSH_TIMEOUT   = 20;
     const PUSH_QUEUE_MAX = 500;
 
-    /* Un hub garde parfois sa connexion ouverte entre deux messages : on la
-     * laisse vivre, mais pas indéfiniment, et pas à n'importe qui en nombre. */
-    const CLIENT_IDLE  = 600;
-    const MAX_CLIENTS  = 32;
+    /* La configuration est lue dans la boucle : un délai court, pour ne pas
+     * laisser un hub sans accusé pendant qu'on attend Jeedom. */
+    const CONFIG_TIMEOUT = 2;
+
+    /*
+     * Connexions TCP. Un hub garde parfois la sienne ouverte entre deux
+     * messages : elle vit tant qu'elle sert, mais une connexion qui n'a jamais
+     * produit de trame valide est fermée vite, et quand toutes les places sont
+     * prises c'est la plus ancienne inactive qui cède. Sans cela, quelques
+     * connexions muettes suffiraient à rendre le récepteur sourd.
+     */
+    const CLIENT_IDLE    = 600;
+    const CLIENT_PROBING = 30;
+    const MAX_CLIENTS    = 32;
+    const MAX_PER_PEER   = 8;
+    const MAX_INVALID    = 5;        // trames illisibles avant fermeture
 
     /* Un hub réémet un message dont il n'a pas eu l'accusé, avec le même numéro
      * de séquence. Le journal le garde, Jeedom ne le traite qu'une fois. */
@@ -90,19 +106,33 @@ class AjaxSiaDaemon {
 
     const RAW_MAX = 1024;            // taille gardée d'une trame dans le journal
 
+    /* Le journal ne doit pas pouvoir remplir le disque : au-delà de cette
+     * taille, seuls les messages acceptés porteurs d'événements y entrent
+     * encore, et les refus répétés d'un même émetteur sont résumés. */
+    const JOURNAL_DAY_MAX = 52428800;   // 50 Mo
+    const NOISE_WINDOW    = 60;
+
+    const MAX_PEERS = 64;            // émetteurs gardés dans les statistiques
+
     private $opt;
     private $config = array();
     private $tcp = null;
     private $udp = null;
+    private $tcpPort = 0;            // port réellement ouvert, 0 sinon
+    private $udpPort = 0;
+    private $listenError = '';
+    private $lastListenTry = 0;
     private $control = null;
-    private $listening = '';         // « port/udp » effectivement ouverts
-    private $clients = array();      // (int) ressource => client
+    private $clients = array();      // (int) ressource => client TCP
+    private $orders = array();       // (int) ressource => connexion d'ordres
     private $pushQueue = array();
     private $pushPid = 0;
     private $dedup = array();
+    private $noise = array();        // émetteur|motif => [début, nombre]
     private $reloadPending = false;
     private $running = true;
     private $lastPurge = 0;
+    private $uid = 0;
     private $stats = array(
         'started'   => 0,
         'frames'    => 0,
@@ -122,26 +152,27 @@ class AjaxSiaDaemon {
 
     /* ------------------------------------------------------------- callback */
 
-    private function callback($_query = '', $_body = null) {
+    private function callback($_query = '', $_body = null, $_timeout = self::PUSH_TIMEOUT, $_attempts = 2) {
         $url = $this->opt['callback'] . '?apikey=' . urlencode($this->opt['apikey']) . $_query;
 
-        for ($i = 0; $i < self::PUSH_ATTEMPTS; $i++) {
+        for ($i = 0; $i < $_attempts; $i++) {
             $ch = curl_init($url);
             $options = array(
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_CONNECTTIMEOUT => 2,
-                CURLOPT_TIMEOUT        => self::PUSH_TIMEOUT,
+                CURLOPT_TIMEOUT        => $_timeout,
                 CURLOPT_SSL_VERIFYPEER => false,
                 CURLOPT_SSL_VERIFYHOST => false,
             );
             if ($_body !== null) {
                 $options[CURLOPT_POST] = true;
-                $options[CURLOPT_POSTFIELDS] = json_encode($_body);
+                $options[CURLOPT_POSTFIELDS] = json_encode($_body, JSON_INVALID_UTF8_SUBSTITUTE);
                 $options[CURLOPT_HTTPHEADER] = array('Content-Type: application/json');
             }
             curl_setopt_array($ch, $options);
             $response = curl_exec($ch);
             $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $errno = curl_errno($ch);
             $error = curl_error($ch);
             curl_close($ch);
 
@@ -151,30 +182,42 @@ class AjaxSiaDaemon {
                 if ($_body === null || trim((string) $response) === 'OK') {
                     return $response;
                 }
-                SiaLog::error('lot refusé par Jeedom : ' . substr(trim((string) $response), 0, 200)
-                            . ' — tentative ' . ($i + 1) . '/' . self::PUSH_ATTEMPTS);
-            } else {
-                SiaLog::error('callback en échec (HTTP ' . $code . ($error != '' ? ' / ' . $error : '')
-                            . ') tentative ' . ($i + 1) . '/' . self::PUSH_ATTEMPTS);
+                SiaLog::error('lot refusé par Jeedom : ' . AjaxSiaCodec::clean(substr(trim((string) $response), 0, 200)));
+                return false;
             }
+            SiaLog::error('callback en échec (HTTP ' . $code . ($error != '' ? ' / ' . $error : '') . ')');
+            /* Nouvelle tentative seulement si Jeedom n'a jamais reçu la requête. */
+            if ($errno !== CURLE_COULDNT_CONNECT || $i + 1 >= $_attempts) {
+                return false;
+            }
+            sleep(1);
         }
         return false;
     }
 
     private function loadConfig() {
-        $raw = $this->callback('&action=config');
+        /* Une seule tentative, délai court : pendant ce temps la boucle ne
+         * répond plus aux hubs. En cas d'échec l'ancienne configuration reste. */
+        $raw = $this->callback('&action=config', null, self::CONFIG_TIMEOUT, $this->stats['started'] > 0 ? 1 : 2);
         if ($raw === false) {
             SiaLog::error('configuration illisible depuis Jeedom');
             return false;
         }
         $config = json_decode($raw, true);
         if (!is_array($config) || !isset($config['port'])) {
-            /* 80 caractères : de quoi reconnaître une page d'erreur, pas assez
-             * pour recopier une clé de chiffrement dans le journal. */
-            SiaLog::error('configuration invalide : ' . substr((string) $raw, 0, 80));
+            /* Une configuration contient des clés de chiffrement : on n'en
+             * recopie jamais rien, seulement de quoi reconnaître une page
+             * d'erreur HTML. */
+            $head = ltrim((string) $raw);
+            SiaLog::error('configuration invalide (' . strlen($raw) . ' octets'
+                        . (($head !== '' && $head[0] !== '{') ? ', début : ' . AjaxSiaCodec::clean(substr($head, 0, 60)) : '') . ')');
             return false;
         }
         $config['port']         = (int) $config['port'];
+        if ($config['port'] < 1 || $config['port'] > 65535) {
+            SiaLog::error('configuration invalide : port ' . $config['port']);
+            return false;
+        }
         $config['udp']          = !empty($config['udp']);
         $config['strict_time']  = !isset($config['strict_time']) || !empty($config['strict_time']);
         $config['journal_days'] = isset($config['journal_days']) ? max(1, (int) $config['journal_days']) : 90;
@@ -188,82 +231,130 @@ class AjaxSiaDaemon {
         if (!empty($config['timezone']) && in_array($config['timezone'], timezone_identifiers_list(), true)) {
             date_default_timezone_set($config['timezone']);
         }
-        SiaLog::info(count($config['hubs']) . ' hub(s) connu(s), écoute sur le port ' . $config['port']
+        SiaLog::info(count($config['hubs']) . ' hub(s) connu(s), réception sur le port ' . $config['port']
                    . ($config['udp'] ? ' (TCP et UDP)' : ' (TCP)'));
         return true;
     }
 
-    /* Clés à essayer pour un compte : la sienne, puis la clé générale. */
+    /* Clé à essayer pour un compte : la sienne s'il en a une, sinon la clé
+     * générale. Un hub qui a sa propre clé n'accepte que celle-là. */
     public function keysFor($_account) {
-        $keys = array();
         if (isset($this->config['hubs'][$_account]['key']) && $this->config['hubs'][$_account]['key'] !== '') {
-            $keys[] = $this->config['hubs'][$_account]['key'];
+            return array($this->config['hubs'][$_account]['key']);
         }
-        if ($this->config['key'] !== '' && !in_array($this->config['key'], $keys, true)) {
-            $keys[] = $this->config['key'];
-        }
-        return $keys;
+        return ($this->config['key'] !== '') ? array($this->config['key']) : array();
     }
 
     /* ------------------------------------------------------------ écoute */
 
-    /* Ouvre (ou rouvre, si le port a changé) les sockets de réception. */
-    private function openListeners() {
-        $wanted = $this->config['port'] . '/' . ($this->config['udp'] ? 'udp' : '');
-        if ($wanted === $this->listening) {
+    /*
+     * Met les sockets de réception en accord avec la configuration. Le nouveau
+     * port est ouvert AVANT de fermer l'ancien : si l'ouverture échoue (port
+     * pris, refusé), le démon continue de recevoir sur l'ancien au lieu de
+     * devenir sourd, et réessaie à chaque demi-minute.
+     */
+    private function syncListeners($_force = false) {
+        $port = $this->config['port'];
+        $wantUdp = $this->config['udp'];
+        if ($this->tcpPort === $port && ($wantUdp ? $this->udpPort === $port : $this->udpPort === 0)) {
+            $this->listenError = '';
             return true;
         }
-        $this->closeListeners();
-        $port = $this->config['port'];
-        $errno = 0; $errstr = '';
-        $tcp = @stream_socket_server('tcp://0.0.0.0:' . $port, $errno, $errstr);
-        if ($tcp === false) {
-            SiaLog::error('écoute TCP impossible sur le port ' . $port . ' : ' . $errstr);
+        if (!$_force && time() - $this->lastListenTry < 30) {
             return false;
         }
-        stream_set_blocking($tcp, false);
-        $this->tcp = $tcp;
-        if ($this->config['udp']) {
-            $udp = @stream_socket_server('udp://0.0.0.0:' . $port, $errno, $errstr, STREAM_SERVER_BIND);
-            if ($udp === false) {
-                SiaLog::error('écoute UDP impossible sur le port ' . $port . ' : ' . $errstr);
-            } else {
-                stream_set_blocking($udp, false);
-                $this->udp = $udp;
+        $this->lastListenTry = time();
+        $errors = array();
+
+        /* Les nouvelles sockets sont toutes ouvertes avant qu'une seule ne
+         * remplace l'ancienne : TCP et UDP basculent ensemble ou pas du tout. */
+        $newTcp = null;
+        $newUdp = null;
+        if ($this->tcpPort !== $port) {
+            $errno = 0; $errstr = '';
+            $newTcp = @stream_socket_server('tcp://0.0.0.0:' . $port, $errno, $errstr);
+            if ($newTcp === false) {
+                $errors[] = 'TCP ' . $port . ' : ' . $errstr;
             }
         }
-        $this->listening = $wanted;
-        SiaLog::info('réception SIA ouverte sur le port ' . $port);
+        if ($wantUdp && $this->udpPort !== $port) {
+            $errno = 0; $errstr = '';
+            $newUdp = @stream_socket_server('udp://0.0.0.0:' . $port, $errno, $errstr, STREAM_SERVER_BIND);
+            if ($newUdp === false) {
+                $errors[] = 'UDP ' . $port . ' : ' . $errstr;
+            }
+        }
+        if (!empty($errors)) {
+            foreach (array($newTcp, $newUdp) as $socket) {
+                if (is_resource($socket)) {
+                    fclose($socket);
+                }
+            }
+        } else {
+            if (is_resource($newTcp)) {
+                stream_set_blocking($newTcp, false);
+                if (is_resource($this->tcp)) {
+                    fclose($this->tcp);
+                    SiaLog::info('écoute TCP déplacée du port ' . $this->tcpPort . ' au port ' . $port);
+                }
+                $this->tcp = $newTcp;
+                $this->tcpPort = $port;
+            }
+            if (is_resource($newUdp)) {
+                stream_set_blocking($newUdp, false);
+                if (is_resource($this->udp)) {
+                    fclose($this->udp);
+                }
+                $this->udp = $newUdp;
+                $this->udpPort = $port;
+            }
+            if (!$wantUdp && is_resource($this->udp)) {
+                fclose($this->udp);
+                $this->udp = null;
+                $this->udpPort = 0;
+            }
+        }
+
+        if (!empty($errors)) {
+            $this->listenError = 'écoute impossible (' . implode(', ', $errors) . ')';
+            SiaLog::error($this->listenError . ($this->tcpPort > 0 && $this->tcpPort !== $port
+                ? ' — réception maintenue sur l\'ancien port ' . $this->tcpPort : '') . ', nouvel essai dans 30 s');
+            return false;
+        }
+        $this->listenError = '';
+        SiaLog::info('réception SIA ouverte sur le port ' . $port . ($wantUdp ? ' (TCP et UDP)' : ' (TCP)'));
         return true;
     }
 
     private function closeListeners() {
-        foreach ($this->clients as $key => $client) {
+        foreach ($this->clients as $client) {
             @fclose($client['stream']);
         }
         $this->clients = array();
-        if (is_resource($this->tcp)) {
-            fclose($this->tcp);
-        }
-        if (is_resource($this->udp)) {
-            fclose($this->udp);
+        foreach (array($this->tcp, $this->udp) as $socket) {
+            if (is_resource($socket)) {
+                fclose($socket);
+            }
         }
         $this->tcp = null;
         $this->udp = null;
-        $this->listening = '';
+        $this->tcpPort = 0;
+        $this->udpPort = 0;
     }
 
     /* --------------------------------------------------------------- démarrage */
 
     public function run() {
-        if (trim((string) $this->callback('&test=1')) !== 'OK') {
+        if (trim((string) $this->callback('&test=1', null, self::CONFIG_TIMEOUT)) !== 'OK') {
             SiaLog::error('callback injoignable : ' . $this->opt['callback']);
             return 1;
         }
         if (!$this->loadConfig()) {
             return 1;
         }
-        if (!$this->openListeners()) {
+        /* Au démarrage, pas de port de repli : sans écoute TCP, inutile de tourner. */
+        $this->syncListeners(true);
+        if ($this->tcpPort === 0) {
             return 1;
         }
 
@@ -283,7 +374,11 @@ class AjaxSiaDaemon {
         $this->loop();
 
         SiaLog::info('arrêt du démon');
+        $this->flushNoise(true);
         $this->closeListeners();
+        foreach ($this->orders as $order) {
+            @fclose($order['stream']);
+        }
         if (is_resource($this->control)) {
             fclose($this->control);
         }
@@ -299,8 +394,10 @@ class AjaxSiaDaemon {
             if ($this->reloadPending) {
                 $this->reloadPending = false;
                 if ($this->loadConfig()) {
-                    $this->openListeners();
+                    $this->syncListeners(true);
                 }
+            } else {
+                $this->syncListeners();
             }
 
             $read = array($this->control);
@@ -313,6 +410,9 @@ class AjaxSiaDaemon {
             foreach ($this->clients as $client) {
                 $read[] = $client['stream'];
             }
+            foreach ($this->orders as $order) {
+                $read[] = $order['stream'];
+            }
             $write = null; $except = null;
             $ready = @stream_select($read, $write, $except, 1);
 
@@ -324,6 +424,8 @@ class AjaxSiaDaemon {
                         $this->acceptClients();
                     } elseif ($stream === $this->udp) {
                         $this->readDatagrams();
+                    } elseif (isset($this->orders[(int) $stream])) {
+                        $this->readOrder($stream);
                     } else {
                         $this->readClient($stream);
                     }
@@ -331,11 +433,17 @@ class AjaxSiaDaemon {
             }
 
             $this->expireClients();
+            $this->expireOrders();
+            $this->flushNoise();
             $this->purgeJournal();
         }
     }
 
     /* ------------------------------------------------------------ clients TCP */
+
+    private static function peerIp($_peer) {
+        return trim(preg_replace('/:\d+$/', '', (string) $_peer), '[]');
+    }
 
     private function acceptClients() {
         for ($i = 0; $i < 8; $i++) {
@@ -344,27 +452,63 @@ class AjaxSiaDaemon {
             if ($stream === false) {
                 return;
             }
-            if (!$this->allowed($peer)) {
-                $this->journal(array('peer' => $peer, 'proto' => 'tcp', 'status' => 'refused',
-                                     'error' => 'adresse non autorisée'));
-                SiaLog::warning('connexion refusée depuis ' . $peer . ' (adresse non autorisée)');
+            $ip = self::peerIp($peer);
+            if (!$this->allowed($ip)) {
+                $this->journalNoise($peer, 'tcp', 'refused', 'adresse non autorisée');
                 @fclose($stream);
                 continue;
             }
-            if (count($this->clients) >= self::MAX_CLIENTS) {
-                SiaLog::warning('trop de connexions ouvertes, ' . $peer . ' refusé');
-                @fclose($stream);
-                continue;
+            $samePeer = array_filter($this->clients, function ($_c) use ($ip) { return $_c['ip'] === $ip; });
+            if (count($samePeer) >= self::MAX_PER_PEER) {
+                $this->evictClient($this->oldestIdle($samePeer), 'trop de connexions de ' . $ip);
+            } elseif (count($this->clients) >= self::MAX_CLIENTS) {
+                $this->evictClient($this->oldestIdle($this->clients), 'plus de place');
             }
             stream_set_blocking($stream, false);
             $this->clients[(int) $stream] = array(
-                'stream' => $stream,
-                'peer'   => $peer,
-                'buffer' => '',
-                'last'   => time(),
+                'stream'  => $stream,
+                'peer'    => $peer,
+                'ip'      => $ip,
+                'buffer'  => '',
+                'opened'  => time(),
+                'last'    => time(),
+                'valid'   => false,       // a déjà produit une trame valide
+                'invalid' => 0,
             );
             SiaLog::debug('connexion de ' . $peer);
         }
+    }
+
+    /* La connexion inactive depuis le plus longtemps, celles qui n'ont jamais
+     * rien produit de valide passant en premier. */
+    private function oldestIdle($_clients) {
+        $oldest = null;
+        foreach ($_clients as $id => $client) {
+            $score = $client['last'] - ($client['valid'] ? 0 : 100000);
+            if ($oldest === null || $score < $oldest[1]) {
+                $oldest = array($id, $score);
+            }
+        }
+        return ($oldest === null) ? null : $oldest[0];
+    }
+
+    /* Avant de fermer une connexion pour faire de la place, on lit ce qu'elle
+     * a déjà envoyé : une trame arrivée ne doit pas se perdre sans accusé. */
+    private function evictClient($_id, $_reason) {
+        if ($_id === null || !isset($this->clients[$_id])) {
+            return;
+        }
+        $this->readClient($this->clients[$_id]['stream']);
+        $this->closeClient($_id, $_reason);
+    }
+
+    private function closeClient($_id, $_reason) {
+        if ($_id === null || !isset($this->clients[$_id])) {
+            return;
+        }
+        SiaLog::debug('connexion fermée (' . $_reason . ') : ' . $this->clients[$_id]['peer']);
+        @fclose($this->clients[$_id]['stream']);
+        unset($this->clients[$_id]);
     }
 
     private function readClient($_stream) {
@@ -374,17 +518,22 @@ class AjaxSiaDaemon {
         }
         $chunk = @fread($_stream, 8192);
         if ($chunk === false || ($chunk === '' && feof($_stream))) {
-            SiaLog::debug('déconnexion de ' . $this->clients[$id]['peer']);
-            @fclose($_stream);
-            unset($this->clients[$id]);
+            $this->closeClient($id, 'fermée par l\'émetteur');
             return;
         }
         $this->clients[$id]['last'] = time();
         $this->clients[$id]['buffer'] .= $chunk;
         foreach (AjaxSiaCodec::extractFrames($this->clients[$id]['buffer']) as $frame) {
-            $reply = $this->handleFrame($frame, $this->clients[$id]['peer'], 'tcp');
-            if ($reply !== null) {
-                @fwrite($_stream, $reply);
+            $result = $this->handleFrame($frame, $this->clients[$id]['peer'], 'tcp');
+            if ($result['reply'] !== null) {
+                @fwrite($_stream, $result['reply']);
+            }
+            if ($result['valid']) {
+                $this->clients[$id]['valid'] = true;
+                $this->clients[$id]['invalid'] = 0;
+            } elseif (++$this->clients[$id]['invalid'] >= self::MAX_INVALID) {
+                $this->closeClient($id, self::MAX_INVALID . ' trames illisibles');
+                return;
             }
         }
     }
@@ -392,20 +541,20 @@ class AjaxSiaDaemon {
     private function readDatagrams() {
         for ($i = 0; $i < 16; $i++) {
             $peer = '';
-            $data = @stream_socket_recvfrom($this->udp, 4096, 0, $peer);
+            $data = @stream_socket_recvfrom($this->udp, 8192, 0, $peer);
             if ($data === false || $data === '') {
                 return;
             }
-            if (!$this->allowed($peer)) {
-                SiaLog::debug('datagramme ignoré depuis ' . $peer . ' (adresse non autorisée)');
+            if (!$this->allowed(self::peerIp($peer))) {
+                $this->journalNoise($peer, 'udp', 'refused', 'adresse non autorisée');
                 continue;
             }
             /* Un datagramme est une trame : le CR final peut manquer. */
             $buffer = (substr($data, -1) === "\r") ? $data : $data . "\r";
             foreach (AjaxSiaCodec::extractFrames($buffer) as $frame) {
-                $reply = $this->handleFrame($frame, $peer, 'udp');
-                if ($reply !== null) {
-                    @stream_socket_sendto($this->udp, $reply, 0, $peer);
+                $result = $this->handleFrame($frame, $peer, 'udp');
+                if ($result['reply'] !== null) {
+                    @stream_socket_sendto($this->udp, $result['reply'], 0, $peer);
                 }
             }
         }
@@ -414,38 +563,39 @@ class AjaxSiaDaemon {
     private function expireClients() {
         $now = time();
         foreach ($this->clients as $id => $client) {
-            if ($now - $client['last'] > self::CLIENT_IDLE) {
-                SiaLog::debug('connexion inactive fermée : ' . $client['peer']);
-                @fclose($client['stream']);
-                unset($this->clients[$id]);
+            if (!$client['valid'] && $now - $client['opened'] > self::CLIENT_PROBING) {
+                $this->closeClient($id, 'aucune trame valide en ' . self::CLIENT_PROBING . ' s');
+            } elseif ($now - $client['last'] > self::CLIENT_IDLE) {
+                $this->closeClient($id, 'inactive');
             }
         }
     }
 
     /* Liste blanche : vide, elle laisse tout passer. */
-    private function allowed($_peer) {
-        if (empty($this->config['allowed'])) {
-            return true;
-        }
-        $ip = preg_replace('/:\d+$/', '', $_peer);
-        $ip = trim($ip, '[]');
-        return in_array($ip, $this->config['allowed'], true);
+    private function allowed($_ip) {
+        return empty($this->config['allowed']) || in_array($_ip, $this->config['allowed'], true);
     }
 
     /* --------------------------------------------------------------- trames */
 
     /*
-     * Traite une trame et rend la réponse à renvoyer (ou null).
+     * Traite une trame. Rend la réponse à renvoyer (ou null) et si la trame
+     * était valide, ce qui garde la connexion TCP en vie.
      *
-     * Trame illisible, CRC faux ou clé inconnue : aucune réponse. C'est ce que
-     * prévoit la norme ; le hub réémettra, et le journal montre pourquoi.
+     * Trame illisible, CRC faux, clé inconnue ou message en clair pour un
+     * compte chiffré : aucune réponse. Le hub réémettra, et le journal dit
+     * pourquoi.
      */
     private function handleFrame($_frame, $_peer, $_proto) {
         $now = microtime(true);
         $msg = AjaxSiaCodec::parse($_frame, array($this, 'keysFor'), (int) $now);
         $this->stats['frames']++;
         $this->stats['lastFrame'] = (int) $now;
-        $this->stats['peers'][preg_replace('/:\d+$/', '', $_peer)] = (int) $now;
+        $this->stats['peers'][self::peerIp($_peer)] = (int) $now;
+        if (count($this->stats['peers']) > self::MAX_PEERS) {
+            arsort($this->stats['peers']);
+            $this->stats['peers'] = array_slice($this->stats['peers'], 0, self::MAX_PEERS, true);
+        }
 
         $reply = null;
         $replyName = '';
@@ -453,6 +603,25 @@ class AjaxSiaDaemon {
         $error = $msg['error'];
         $duplicate = false;
 
+        /*
+         * Dès qu'une clé est connue pour ce compte (la sienne ou la clé
+         * générale), le clair est refusé : sinon n'importe quelle machine du
+         * réseau pourrait envoyer un faux désarmement en recopiant le numéro de
+         * compte, qui circule en clair même dans les trames chiffrées.
+         */
+        if ($status === 'ok' && !$msg['encrypted'] && !empty($this->keysFor($msg['account']))) {
+            $status = 'plain';
+            $error = 'message en clair pour un compte chiffré';
+            /* Un test de liaison en clair ne porte aucun événement : il est
+             * accusé, pour que le hub ne croie pas le centre tombé, mais ni remis
+             * à Jeedom ni compté comme contact — un faux test ne doit pas
+             * masquer un hub coupé. */
+            if ($msg['type'] === 'NULL') {
+                $error = 'test de liaison en clair pour un compte chiffré : accusé, ignoré';
+                $reply = AjaxSiaCodec::ack($msg);
+                $replyName = 'ACK';
+            }
+        }
         if ($status === 'ok' && AjaxSiaCodec::outsideWindow($msg) && $this->config['strict_time']) {
             $status = 'window';
             $error = 'horodatage hors fenêtre (écart ' . $msg['skew'] . ' s)';
@@ -465,11 +634,23 @@ class AjaxSiaDaemon {
             $reply = AjaxSiaCodec::nak($msg);
             $replyName = 'NAK';
         }
+        $valid = ($msg['status'] === 'ok');
 
         $events = array();
         foreach ($msg['events'] as $event) {
             $info = AjaxSiaCodec::describe($event['code']);
+            $event['text'] = AjaxSiaCodec::clean($event['text']);
             $events[] = $event + array('label' => $info['l'], 'cat' => $info['c']);
+        }
+
+        $what = $msg['type'] . ' #' . $msg['account'] . ' seq ' . $msg['seq']
+              . ($msg['data'] !== '' ? ' [' . $msg['data'] . ']' : '');
+        if (in_array($status, array('format', 'crc'))) {
+            /* Bruit : résumé par émetteur, pour que le journal ne puisse pas
+             * servir à remplir le disque. */
+            $this->stats['rejected']++;
+            $this->journalNoise($_peer, $_proto, $status, $error, $msg['raw']);
+            return array('reply' => null, 'valid' => false);
         }
 
         $entry = array(
@@ -478,36 +659,37 @@ class AjaxSiaDaemon {
             'proto'   => $_proto,
             'status'  => $duplicate ? 'duplicate' : $status,
             'error'   => $error,
+            'warning' => $msg['warning'],
             'reply'   => $replyName,
             'type'    => $msg['type'],
             'enc'     => $msg['encrypted'],
             'account' => $msg['account'],
             'seq'     => $msg['seq'],
             'data'    => $msg['data'],
-            'xdata'   => $msg['xdata'],
+            'xdata'   => array_map(array('AjaxSiaCodec', 'clean'), $msg['xdata']),
             'skew'    => $msg['skew'],
             'events'  => $events,
-            'raw'     => substr($msg['raw'], 0, self::RAW_MAX),
+            'raw'     => AjaxSiaCodec::clean(substr($msg['raw'], 0, self::RAW_MAX)),
         );
         if ($msg['encrypted'] && $msg['content'] !== '') {
             $entry['content'] = $msg['content'];
         }
-        $this->journal($entry);
+        $this->journal($entry, $status === 'ok' && !$duplicate && !empty($events));
 
-        $what = $msg['type'] . ' #' . $msg['account'] . ' seq ' . $msg['seq']
-              . ($msg['data'] !== '' ? ' [' . $msg['data'] . ']' : '');
         if ($status === 'ok') {
             $this->stats['accepted']++;
-            SiaLog::info(($duplicate ? 'doublon ' : 'reçu ') . $what . ' de ' . $_peer . ' → ACK');
+            SiaLog::info(($duplicate ? 'doublon ' : 'reçu ') . $what . ' de ' . $_peer . ' → ACK'
+                       . ($msg['warning'] !== '' ? ' (' . $msg['warning'] . ')' : ''));
         } else {
             $this->stats['rejected']++;
             SiaLog::warning('refusé (' . $error . ') ' . $what . ' de ' . $_peer
                           . ($replyName !== '' ? ' → ' . $replyName : ''));
         }
-        SiaLog::debug('trame : ' . $msg['raw']);
+        SiaLog::debug('trame : ' . AjaxSiaCodec::clean($msg['raw']));
 
         if ($status === 'ok' && !$duplicate) {
             $this->push(array(
+                'uid'     => getmypid() . '-' . $this->stats['started'] . '-' . (++$this->uid),
                 't'       => $entry['t'],
                 'peer'    => $_peer,
                 'type'    => $msg['type'],
@@ -517,7 +699,7 @@ class AjaxSiaDaemon {
                 'events'  => $events,
             ));
         }
-        return $reply;
+        return array('reply' => $reply, 'valid' => $valid);
     }
 
     private function isDuplicate($_msg, $_now) {
@@ -545,8 +727,12 @@ class AjaxSiaDaemon {
         return __DIR__ . '/../../data/journal';
     }
 
-    /* Une ligne JSON par trame, un fichier par jour. */
-    private function journal($_entry) {
+    /*
+     * Une ligne JSON par trame, un fichier par jour. Au-delà de la taille
+     * maximale du jour, seuls les messages porteurs d'événements y entrent
+     * encore : c'est ce qu'on voudra relire.
+     */
+    private function journal($_entry, $_important = false) {
         $dir = $this->journalDir();
         if (!is_dir($dir) && !@mkdir($dir, 0775, true)) {
             SiaLog::error('dossier du journal impossible à créer : ' . $dir);
@@ -554,9 +740,49 @@ class AjaxSiaDaemon {
         }
         $_entry += array('t' => round(microtime(true), 3));
         $file = $dir . '/' . date('Y-m-d', (int) $_entry['t']) . '.jsonl';
+        clearstatcache(true, $file);
+        if (!$_important && @filesize($file) > self::JOURNAL_DAY_MAX) {
+            return;
+        }
         $line = json_encode($_entry, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
         if (@file_put_contents($file, $line . "\n", FILE_APPEND | LOCK_EX) === false) {
             SiaLog::error('écriture du journal impossible : ' . $file);
+        }
+    }
+
+    /*
+     * Refus répétés (bruit, émetteur non autorisé) : la première occurrence
+     * est consignée, les suivantes sont comptées, et le total est consigné une
+     * fois par minute et par émetteur.
+     */
+    private function journalNoise($_peer, $_proto, $_status, $_error, $_raw = '') {
+        $key = self::peerIp($_peer) . '|' . $_status;
+        $this->flushNoise();
+        if (isset($this->noise[$key])) {
+            $this->noise[$key][1]++;
+            return;
+        }
+        $this->noise[$key] = array(time(), 0, $_peer, $_proto, $_status);
+        $this->journal(array('peer' => $_peer, 'proto' => $_proto, 'status' => $_status, 'error' => $_error,
+                             'raw' => AjaxSiaCodec::clean(substr((string) $_raw, 0, self::RAW_MAX))));
+        SiaLog::warning('refusé (' . $_error . ') de ' . $_peer);
+    }
+
+    /*
+     * Écrit le résumé des fenêtres de bruit écoulées (toutes si $_all, à
+     * l'arrêt). Appelé à chaque tour de boucle : le résumé ne doit pas
+     * attendre le bruit suivant. Daté du début de la fenêtre.
+     */
+    private function flushNoise($_all = false) {
+        $now = time();
+        foreach ($this->noise as $k => $n) {
+            if ($_all || $now - $n[0] >= self::NOISE_WINDOW) {
+                if ($n[1] > 0) {
+                    $this->journal(array('t' => $n[0], 'peer' => $n[2], 'proto' => $n[3], 'status' => $n[4],
+                                         'error' => $n[1] . ' autre(s) refus du même type en ' . self::NOISE_WINDOW . ' s'));
+                }
+                unset($this->noise[$k]);
+            }
         }
     }
 
@@ -566,7 +792,8 @@ class AjaxSiaDaemon {
             return;
         }
         $this->lastPurge = time();
-        $limit = date('Y-m-d', time() - 86400 * $this->config['journal_days']);
+        /* N jours conservés, aujourd'hui compris. */
+        $limit = date('Y-m-d', time() - 86400 * ($this->config['journal_days'] - 1));
         foreach ((array) glob($this->journalDir() . '/*.jsonl') as $file) {
             if (basename($file, '.jsonl') < $limit) {
                 @unlink($file);
@@ -581,7 +808,7 @@ class AjaxSiaDaemon {
         $this->pushQueue[] = $_event;
         if (count($this->pushQueue) > self::PUSH_QUEUE_MAX) {
             array_shift($this->pushQueue);
-            SiaLog::warning('file d\'envoi saturée, le plus ancien événement est abandonné');
+            SiaLog::warning('file d\'envoi saturée, le plus ancien événement est abandonné (il reste au journal)');
         }
         $this->drainPushQueue();
     }
@@ -608,7 +835,7 @@ class AjaxSiaDaemon {
 
         $pid = pcntl_fork();
         if ($pid == -1) {
-            SiaLog::error('fork impossible pour l\'envoi, lot abandonné');
+            SiaLog::error('fork impossible pour l\'envoi, lot abandonné (il reste au journal)');
             return;
         }
         if ($pid > 0) {
@@ -628,6 +855,9 @@ class AjaxSiaDaemon {
         foreach ($this->clients as $client) {
             @fclose($client['stream']);
         }
+        foreach ($this->orders as $order) {
+            @fclose($order['stream']);
+        }
         foreach (array($this->tcp, $this->udp, $this->control) as $socket) {
             if (is_resource($socket)) {
                 fclose($socket);
@@ -643,56 +873,76 @@ class AjaxSiaDaemon {
 
     /* ------------------------------------------------------ ordres Jeedom */
 
+    /*
+     * Les connexions d'ordres passent par la boucle principale, comme les
+     * autres : une connexion locale muette ne peut plus retenir la réception.
+     */
     private function acceptOrders() {
         for ($i = 0; $i < 8; $i++) {
             $conn = @stream_socket_accept($this->control, 0);
             if ($conn === false) {
                 return;
             }
-            $this->handleOrder($conn);
+            if (count($this->orders) >= 16) {
+                @fclose($conn);
+                continue;
+            }
+            stream_set_blocking($conn, false);
+            $this->orders[(int) $conn] = array('stream' => $conn, 'buffer' => '', 'opened' => microtime(true));
         }
     }
 
-    /* Lecture bornée à 1 s : un client muet ne doit pas immobiliser la boucle. */
-    private function handleOrder($_conn) {
-        stream_set_blocking($_conn, false);
-        $line = '';
-        $deadline = microtime(true) + 1.0;
-        while (microtime(true) < $deadline && strpos($line, "\n") === false) {
-            $read = array($_conn); $write = null; $except = null;
-            if (@stream_select($read, $write, $except, 0, 100000) < 1) {
-                continue;
-            }
-            $chunk = @fread($_conn, 65535);
-            if ($chunk === false || $chunk === '') {
-                break;
-            }
-            $line .= $chunk;
+    private function readOrder($_stream) {
+        $id = (int) $_stream;
+        $chunk = @fread($_stream, 65535);
+        if ($chunk === false || ($chunk === '' && feof($_stream))) {
+            @fclose($_stream);
+            unset($this->orders[$id]);
+            return;
         }
-        $order = json_decode(trim($line), true);
-        $result = array('state' => 'ok');
+        $this->orders[$id]['buffer'] .= $chunk;
+        if (strpos($this->orders[$id]['buffer'], "\n") === false) {
+            if (strlen($this->orders[$id]['buffer']) > 65535) {
+                @fclose($_stream);
+                unset($this->orders[$id]);
+            }
+            return;
+        }
+        $result = $this->handleOrder(trim($this->orders[$id]['buffer']));
+        @fwrite($_stream, json_encode($result) . "\n");
+        @fclose($_stream);
+        unset($this->orders[$id]);
+    }
+
+    private function expireOrders() {
+        foreach ($this->orders as $id => $order) {
+            if (microtime(true) - $order['opened'] > 1) {
+                @fclose($order['stream']);
+                unset($this->orders[$id]);
+            }
+        }
+    }
+
+    private function handleOrder($_line) {
+        $order = json_decode($_line, true);
         if (!is_array($order) || !isset($order['apikey']) || !hash_equals($this->opt['apikey'], (string) $order['apikey'])) {
-            $result = array('state' => 'error', 'result' => 'clé API invalide');
-        } else {
-            switch (isset($order['cmd']) ? $order['cmd'] : '') {
-                case 'reload':
-                    $this->reloadPending = true;
-                    break;
-                case 'status':
-                    $result['result'] = $this->stats + array(
-                        'port'    => $this->config['port'],
-                        'udp'     => is_resource($this->udp),
-                        'clients' => array_values(array_map(function ($_c) {
-                            return array('peer' => $_c['peer'], 'last' => $_c['last']);
-                        }, $this->clients)),
-                    );
-                    break;
-                default:
-                    $result = array('state' => 'error', 'result' => 'commande inconnue');
-            }
+            return array('state' => 'error', 'result' => 'clé API invalide');
         }
-        @fwrite($_conn, json_encode($result) . "\n");
-        @fclose($_conn);
+        switch (isset($order['cmd']) ? $order['cmd'] : '') {
+            case 'reload':
+                $this->reloadPending = true;
+                return array('state' => 'ok');
+            case 'status':
+                return array('state' => 'ok', 'result' => $this->stats + array(
+                    'port'        => $this->config['port'],
+                    'tcp'         => $this->tcpPort,
+                    'udp'         => $this->udpPort,
+                    'wantUdp'     => $this->config['udp'],
+                    'listenError' => $this->listenError,
+                    'clients'     => count($this->clients),
+                ));
+        }
+        return array('state' => 'error', 'result' => 'commande inconnue');
     }
 }
 

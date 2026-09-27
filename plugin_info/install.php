@@ -26,9 +26,15 @@ function ajaxsiabe_install() {
 
 function ajaxsiabe_update() {
     ajaxsiabe_prepareData();
-    /* Recrée les commandes ajoutées par une nouvelle version. */
+    /* Recrée les commandes ajoutées par une nouvelle version, et chiffre les
+     * clés des hubs enregistrées en clair par la version 0.1. Un équipement
+     * qui refuse de s'enregistrer ne doit pas interrompre la mise à jour. */
     foreach (eqLogic::byType('ajaxsiabe') as $eqLogic) {
-        $eqLogic->save();
+        try {
+            $eqLogic->save();
+        } catch (Throwable $e) {
+            log::add('ajaxsiabe', 'error', $eqLogic->getHumanName() . ' : ' . $e->getMessage());
+        }
     }
 }
 

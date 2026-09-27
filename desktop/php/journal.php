@@ -27,10 +27,9 @@ if (!isConnect('admin')) {
 	throw new Exception('{{401 - Accès non autorisé}}');
 }
 $hubs = ajaxsiabe::byTypeAndSearchConfiguration('ajaxsiabe', array('type' => ajaxsiabe::TYPE_HUB));
-$dates = ajaxsiabe::journalDates();
-if (!in_array(date('Y-m-d'), $dates)) {
-	array_unshift($dates, date('Y-m-d'));
-}
+/* « Aujourd'hui » a une valeur vide : c'est le serveur qui décide du jour,
+ * si bien qu'une page restée ouverte après minuit suit le nouveau fichier. */
+$dates = array_values(array_diff(ajaxsiabe::journalDates(), array(date('Y-m-d'))));
 ?>
 
 <div class="row row-overflow" id="div_ajaxsiabeJournal">
@@ -42,6 +41,7 @@ if (!in_array(date('Y-m-d'), $dates)) {
 
 		<form class="form-inline" style="margin-bottom:10px;" onsubmit="return false;">
 			<select class="form-control input-sm" id="sel_ajaxsiabeDate">
+				<option value="">{{Aujourd'hui}}</option>
 				<?php
 				foreach ($dates as $date) {
 					echo '<option value="' . $date . '">' . date_fr(date('l d F Y', strtotime($date))) . '</option>';
@@ -52,7 +52,10 @@ if (!in_array(date('Y-m-d'), $dates)) {
 				<option value="">{{Tous les comptes}}</option>
 				<?php
 				foreach ($hubs as $hub) {
-					echo '<option value="' . htmlspecialchars($hub->getConfiguration('account')) . '">' . $hub->getName() . ' (#' . htmlspecialchars($hub->getConfiguration('account')) . ')</option>';
+					if ($hub->getConfiguration('account') == '') {
+						continue;
+					}
+					echo '<option value="' . htmlspecialchars($hub->getConfiguration('account')) . '">' . htmlspecialchars($hub->getName()) . ' (#' . htmlspecialchars($hub->getConfiguration('account')) . ')</option>';
 				}
 				?>
 			</select>
@@ -64,21 +67,23 @@ if (!in_array(date('Y-m-d'), $dates)) {
 		</form>
 
 		<div class="alert alert-info" style="margin-bottom:10px;">
-			{{Chaque trame reçue est gardée ici, telle quelle et lue en clair. Pour découvrir ce qu'émet votre hub, cochez « Suivi en direct », faites le geste (armer, désarmer, ouvrir une porte, déclencher un sabotage…) et regardez la ligne apparaître. Cliquez sur une ligne pour voir la trame brute.}}
+			{{Chaque trame reçue est gardée ici, telle quelle et lue en clair ; les tests de liaison automatiques sont masqués tant que la case n'est pas cochée. Pour découvrir ce qu'émet votre hub, laissez « Suivi en direct » coché sur « Aujourd'hui », faites le geste (armer, désarmer, ouvrir une porte, déclencher un sabotage…) et regardez la ligne apparaître. Cliquez sur une ligne pour voir la trame brute.}}
 		</div>
 
-		<table class="table table-condensed table-bordered" id="table_ajaxsiabeJournal">
-			<thead>
-				<tr>
-					<th style="width:90px;">{{Heure}}</th>
-					<th style="width:160px;">{{Hub}}</th>
-					<th>{{Événement}}</th>
-					<th style="width:220px;">{{Données SIA}}</th>
-					<th style="width:130px;">{{Réception}}</th>
-				</tr>
-			</thead>
-			<tbody></tbody>
-		</table>
+		<div class="table-responsive">
+			<table class="table table-condensed table-bordered" id="table_ajaxsiabeJournal">
+				<thead>
+					<tr>
+						<th style="width:90px;">{{Heure}}</th>
+						<th class="hidden-xs" style="width:160px;">{{Hub}}</th>
+						<th>{{Événement}}</th>
+						<th class="hidden-xs" style="width:220px;">{{Données SIA}}</th>
+						<th style="width:130px;">{{Réception}}</th>
+					</tr>
+				</thead>
+				<tbody></tbody>
+			</table>
+		</div>
 	</div>
 </div>
 

@@ -20,14 +20,19 @@
 var ajaxsiabeJournalStatus = {
   ok: { label: '{{Accepté}}', css: 'success' },
   duplicate: { label: '{{Doublon}}', css: 'info' },
+  plain: { label: '{{En clair}}', css: 'danger' },
   window: { label: '{{Mal daté}}', css: 'warning' },
   timestamp: { label: '{{Sans heure}}', css: 'warning' },
   decrypt: { label: '{{Clé fausse}}', css: 'danger' },
   crc: { label: '{{CRC faux}}', css: 'danger' },
-  length: { label: '{{Longueur fausse}}', css: 'danger' },
   format: { label: '{{Illisible}}', css: 'danger' },
   refused: { label: '{{Refusé}}', css: 'danger' }
 }
+
+/* Numéro de la dernière requête partie, et signature du dernier rendu. */
+var ajaxsiabeJournalRequest = 0
+var ajaxsiabeJournalSignature = ''
+var ajaxsiabeJournalErrorShown = false
 
 function ajaxsiabeJournalCell(_row, _text, _className) {
   var td = document.createElement('td')
@@ -37,12 +42,6 @@ function ajaxsiabeJournalCell(_row, _text, _className) {
   }
   _row.appendChild(td)
   return td
-}
-
-function ajaxsiabeJournalTime(_t) {
-  var d = new Date(_t * 1000)
-  var pad = function (n) { return (n < 10 ? '0' : '') + n }
-  return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds())
 }
 
 /* Détail d'une trame, ouvert sous sa ligne. */
@@ -55,6 +54,9 @@ function ajaxsiabeJournalDetail(_entry) {
   if (_entry.error) {
     lines.push('{{Motif}} : ' + _entry.error)
   }
+  if (_entry.warning) {
+    lines.push('{{Remarque}} : ' + _entry.warning)
+  }
   if (_entry.reply) {
     lines.push('{{Réponse}} : ' + _entry.reply)
   }
@@ -64,7 +66,7 @@ function ajaxsiabeJournalDetail(_entry) {
   var events = _entry.events || []
   for (var i = 0; i < events.length; i++) {
     var e = events[i]
-    var parts = [e.code + (e.addr ? ' ' + e.addr : ''), e.label || '']
+    var parts = [(e.code || '?') + (e.addr ? ' ' + e.addr : ''), e.label || '']
     if (e.ri) {
       parts.push('ri ' + e.ri)
     }
@@ -88,24 +90,50 @@ function ajaxsiabeJournalDetail(_entry) {
   return lines.join('\n')
 }
 
+function ajaxsiabeJournalKey(_entry) {
+  return String(_entry.t) + '|' + (_entry.seq || '') + '|' + (_entry.peer || '') + '|' + (_entry.status || '')
+}
+
 function ajaxsiabeJournalRender(_result) {
   var tbody = document.querySelector('#table_ajaxsiabeJournal tbody')
   if (tbody === null) {
     return
   }
+  /* Rien de neuf : on ne touche pas au tableau, pour ne pas perdre une ligne
+     ouverte ni une sélection en cours. */
+  var signature = _result.date + '|' + _result.total + '|' + _result.hiddenTests + '|'
+    + (_result.entries.length > 0 ? ajaxsiabeJournalKey(_result.entries[0]) : '')
+  if (signature === ajaxsiabeJournalSignature) {
+    return
+  }
+  ajaxsiabeJournalSignature = signature
+
   var open = {}
   tbody.querySelectorAll('tr.ajaxsiabeDetail').forEach(function (tr) {
-    open[tr.getAttribute('data-key')] = true
+    if (tr.style.display !== 'none') {
+      open[tr.getAttribute('data-key')] = true
+    }
   })
   tbody.textContent = ''
 
   var count = document.getElementById('span_ajaxsiabeCount')
   if (count !== null) {
-    count.textContent = _result.total + ' {{trame(s)}}' + (_result.truncated ? ' ({{les plus récentes affichées}})' : '')
+    var text = _result.total + ' {{trame(s)}}'
+    if (_result.truncated) {
+      text += ' ({{les plus récentes affichées}})'
+    }
+    if (_result.hiddenTests > 0) {
+      text += ' — ' + _result.hiddenTests + ' {{test(s) de liaison masqué(s)}}'
+    }
+    count.textContent = text
   }
   if (_result.entries.length === 0) {
     var empty = document.createElement('tr')
-    var td = ajaxsiabeJournalCell(empty, '{{Aucune trame pour ce jour et ces filtres.}}')
+    var message = '{{Aucune trame pour ce jour et ces filtres.}}'
+    if (_result.hiddenTests > 0) {
+      message += ' ' + _result.hiddenTests + ' {{test(s) de liaison masqué(s) : cochez « Tests de liaison » pour les voir.}}'
+    }
+    var td = ajaxsiabeJournalCell(empty, message)
     td.colSpan = 5
     td.style.textAlign = 'center'
     tbody.appendChild(empty)
@@ -113,15 +141,13 @@ function ajaxsiabeJournalRender(_result) {
   }
 
   _result.entries.forEach(function (entry) {
-    var key = String(entry.t) + '|' + (entry.seq || '') + '|' + (entry.peer || '')
+    var key = ajaxsiabeJournalKey(entry)
     var row = document.createElement('tr')
     row.style.cursor = 'pointer'
-    row.setAttribute('data-key', key)
-    ajaxsiabeJournalCell(row, ajaxsiabeJournalTime(entry.t))
-    ajaxsiabeJournalCell(row, entry.hub ? entry.hub : (entry.account ? '#' + entry.account : (entry.peer || '')))
-    var text = entry.text || entry.error || ''
-    ajaxsiabeJournalCell(row, text)
-    ajaxsiabeJournalCell(row, (entry.type === 'NULL') ? 'NULL' : (entry.data || ''), 'text-muted')
+    ajaxsiabeJournalCell(row, entry.time || '')
+    ajaxsiabeJournalCell(row, entry.hub ? entry.hub : (entry.account ? '#' + entry.account : (entry.peer || '')), 'hidden-xs')
+    ajaxsiabeJournalCell(row, entry.text || entry.error || '')
+    ajaxsiabeJournalCell(row, (entry.type === 'NULL') ? 'NULL' : (entry.data || ''), 'text-muted hidden-xs')
     var statusCell = ajaxsiabeJournalCell(row, '')
     var status = ajaxsiabeJournalStatus[entry.status] || { label: entry.status, css: 'default' }
     var badge = document.createElement('span')
@@ -134,6 +160,13 @@ function ajaxsiabeJournalRender(_result) {
       lock.title = '{{Message chiffré}}'
       lock.style.marginLeft = '5px'
       statusCell.appendChild(lock)
+    }
+    if (entry.warning) {
+      var warn = document.createElement('i')
+      warn.className = 'fas fa-exclamation-circle'
+      warn.title = entry.warning
+      warn.style.marginLeft = '5px'
+      statusCell.appendChild(warn)
     }
     if (entry.status !== 'ok' && entry.status !== 'duplicate') {
       row.classList.add('warning')
@@ -154,17 +187,31 @@ function ajaxsiabeJournalRender(_result) {
     detail.appendChild(cell)
     detail.style.display = open[key] ? '' : 'none'
     tbody.appendChild(detail)
-
-    row.addEventListener('click', function () {
-      detail.style.display = (detail.style.display === 'none') ? '' : 'none'
-    })
   })
 }
 
-function ajaxsiabeJournalLoad() {
-  if (document.getElementById('table_ajaxsiabeJournal') === null) {
-    return false
+/* Un seul écouteur pour toutes les lignes : ouvre ou ferme le détail. */
+function ajaxsiabeJournalToggle(event) {
+  var row = event.target.closest('#table_ajaxsiabeJournal tbody tr')
+  if (row === null || row.classList.contains('ajaxsiabeDetail')) {
+    return
   }
+  var detail = row.nextElementSibling
+  if (detail !== null && detail.classList.contains('ajaxsiabeDetail')) {
+    detail.style.display = (detail.style.display === 'none') ? '' : 'none'
+  }
+}
+
+function ajaxsiabeJournalLoad(_force) {
+  if (document.getElementById('table_ajaxsiabeJournal') === null) {
+    return
+  }
+  if (_force) {
+    ajaxsiabeJournalSignature = ''
+  }
+  /* Chaque requête est numérotée : une réponse arrivée après une plus récente
+     (changement de filtre pendant un rafraîchissement) est ignorée. */
+  var request = ++ajaxsiabeJournalRequest
   domUtils.ajax({
     type: 'POST',
     url: 'plugins/ajaxsiabe/core/ajax/ajaxsiabe.ajax.php',
@@ -179,20 +226,46 @@ function ajaxsiabeJournalLoad() {
     dataType: 'json',
     global: false,
     noDisplayError: true,
-    error: function () {},
+    error: function () {
+      ajaxsiabeJournalError('{{Journal injoignable : la session a peut-être expiré.}}')
+    },
     success: function (data) {
-      if (data.state != 'ok') {
-        jeedomUtils.showAlert({ message: data.result, level: 'danger' })
+      if (request !== ajaxsiabeJournalRequest) {
         return
       }
+      if (data.state != 'ok') {
+        ajaxsiabeJournalError(data.result)
+        return
+      }
+      ajaxsiabeJournalErrorShown = false
       ajaxsiabeJournalRender(data.result)
     }
   })
-  return true
 }
 
-/* Suivi en direct : le jour affiché doit être aujourd'hui, sinon rien ne peut
-   y arriver. Le minuteur s'arrête seul quand on quitte la page. */
+/* Une erreur n'est annoncée qu'une fois, pas toutes les trois secondes. */
+function ajaxsiabeJournalError(_message) {
+  if (ajaxsiabeJournalErrorShown) {
+    return
+  }
+  ajaxsiabeJournalErrorShown = true
+  jeedomUtils.showAlert({ message: _message, level: 'danger' })
+}
+
+/* Le suivi en direct n'a de sens que sur « Aujourd'hui ». */
+function ajaxsiabeJournalLiveState() {
+  var live = document.getElementById('cb_ajaxsiabeLive')
+  var date = document.getElementById('sel_ajaxsiabeDate')
+  if (live === null || date === null) {
+    return
+  }
+  live.disabled = (date.value !== '')
+  live.parentNode.style.opacity = live.disabled ? '0.5' : ''
+  live.parentNode.title = live.disabled ? '{{Seulement sur « Aujourd\'hui »}}' : ''
+}
+
+/* Rafraîchit en direct, sauf pendant une sélection de texte : elle serait
+   perdue au moment même où on veut copier une trame. */
 function ajaxsiabeJournalTick() {
   if (document.getElementById('table_ajaxsiabeJournal') === null) {
     clearInterval(window.ajaxsiabeJournalTimer)
@@ -201,29 +274,39 @@ function ajaxsiabeJournalTick() {
   }
   var live = document.getElementById('cb_ajaxsiabeLive')
   var date = document.getElementById('sel_ajaxsiabeDate')
-  if (live.checked && date.selectedIndex === 0) {
-    ajaxsiabeJournalLoad()
+  if (!live.checked || date.value !== '') {
+    return
   }
+  var selection = window.getSelection ? String(window.getSelection()) : ''
+  if (selection !== '') {
+    return
+  }
+  ajaxsiabeJournalLoad(false)
 }
 
 var ajaxsiabeJournalRoot = document.getElementById('div_ajaxsiabeJournal')
 if (ajaxsiabeJournalRoot !== null) {
   ajaxsiabeJournalRoot.addEventListener('change', function (event) {
-    if (event.target.closest('select, input[type=checkbox]')) {
-      ajaxsiabeJournalLoad()
+    if (event.target.id === 'sel_ajaxsiabeDate') {
+      ajaxsiabeJournalLiveState()
+    }
+    if (event.target.closest('select, input[type=checkbox]') && event.target.id !== 'cb_ajaxsiabeLive') {
+      ajaxsiabeJournalLoad(true)
     }
   })
   var ajaxsiabeSearchDelay = null
   ajaxsiabeJournalRoot.addEventListener('input', function (event) {
     if (event.target.id === 'in_ajaxsiabeSearch') {
       clearTimeout(ajaxsiabeSearchDelay)
-      ajaxsiabeSearchDelay = setTimeout(ajaxsiabeJournalLoad, 300)
+      ajaxsiabeSearchDelay = setTimeout(function () { ajaxsiabeJournalLoad(true) }, 300)
     }
   })
+  ajaxsiabeJournalRoot.addEventListener('click', ajaxsiabeJournalToggle)
 }
 
 if (window.ajaxsiabeJournalTimer) {
   clearInterval(window.ajaxsiabeJournalTimer)
 }
-ajaxsiabeJournalLoad()
+ajaxsiabeJournalLiveState()
+ajaxsiabeJournalLoad(true)
 window.ajaxsiabeJournalTimer = setInterval(ajaxsiabeJournalTick, 3000)

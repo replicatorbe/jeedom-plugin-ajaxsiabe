@@ -50,8 +50,9 @@ class AjaxSiaCodec {
     const WINDOW_PAST   = 40;
     const WINDOW_FUTURE = 20;
 
-    /* Au-delà, un tampon de réception ne contient plus une trame mais du bruit. */
-    const MAX_FRAME = 4096;
+    /* Au-delà, un tampon de réception ne contient plus une trame mais du bruit.
+     * Une trame de longueur maximale (0FFF) fait 4105 octets avec son en-tête. */
+    const MAX_FRAME = 8192;
 
     /* --------------------------------------------------------------- CRC */
 
@@ -83,7 +84,9 @@ class AjaxSiaCodec {
     public static function extractFrames(&$_buffer) {
         $frames = array();
         while (($end = strpos($_buffer, "\r")) !== false) {
-            $frame = trim(substr($_buffer, 0, $end), "\n\0 ");
+            /* Seuls le LF de tête et les octets nuls sont retirés : un espace fait
+             * partie du corps, l'ôter fausserait le CRC. */
+            $frame = trim(substr($_buffer, 0, $end), "\n\0");
             $_buffer = substr($_buffer, $end + 1);
             if ($frame !== '') {
                 $frames[] = $frame;
@@ -113,6 +116,7 @@ class AjaxSiaCodec {
         $msg = array(
             'status'    => 'ok',
             'error'     => '',
+            'warning'   => '',
             'raw'       => $_frame,
             'crc_ok'    => false,
             'encrypted' => false,
@@ -121,6 +125,7 @@ class AjaxSiaCodec {
             'receiver'  => '',
             'line'      => '',
             'account'   => '',
+            'account_raw' => '',
             'content'   => '',
             'data'      => '',
             'xdata'     => array(),
@@ -142,6 +147,9 @@ class AjaxSiaCodec {
         $msg['seq']       = $m[6];
         $msg['receiver']  = $m[7];
         $msg['line']      = $m[8];
+        /* La recherche du hub se fait en majuscules, mais l'accusé reprend le
+         * compte tel que reçu : un émetteur peut le comparer à l'identique. */
+        $msg['account_raw'] = $m[9];
         $msg['account']   = strtoupper($m[9]);
         $rest             = $m[10];
 
@@ -151,10 +159,11 @@ class AjaxSiaCodec {
             $msg['error'] = 'CRC faux (reçu ' . strtoupper($m[1]) . ', calculé ' . self::crc($body) . ')';
             return $msg;
         }
+        /* Longueur fausse mais CRC juste : la trame est intègre. Certains
+         * émetteurs écrivent la longueur en décimal ; la refuser les rendrait
+         * muets pour de bon. On l'accepte en le signalant. */
         if (hexdec($m[2]) !== strlen($body)) {
-            $msg['status'] = 'length';
-            $msg['error'] = 'longueur annoncée ' . hexdec($m[2]) . ', reçue ' . strlen($body);
-            return $msg;
+            $msg['warning'] = 'longueur annoncée ' . hexdec($m[2]) . ', reçue ' . strlen($body);
         }
 
         if ($msg['encrypted']) {
@@ -173,9 +182,12 @@ class AjaxSiaCodec {
                                              : 'déchiffrement impossible : clé fausse';
                 return $msg;
             }
-            /* Le bourrage de tête ne contient ni « | » ni crochet : tout ce qui
-             * précède le premier de ces caractères est jeté, le « | » avec. */
-            $rest = preg_replace('/^[^|\[\]]*\|?/', '', $plain);
+            /* Le début des données se repère d'abord sur « #compte| », que le
+             * hub répète en tête : c'est sûr même si un bourrage binaire
+             * contient « | » ou « ] ». À défaut, la norme exclut ces caractères
+             * du bourrage : tout ce qui précède le premier est jeté. */
+            $marker = ($msg['account_raw'] !== '') ? strpos($plain, '#' . $msg['account_raw'] . '|') : false;
+            $rest = ($marker !== false) ? substr($plain, $marker) : preg_replace('/^[^|\[\]]*\|?/', '', $plain);
         }
         $msg['content'] = $rest;
 
@@ -205,7 +217,8 @@ class AjaxSiaCodec {
         /* Le compte est souvent répété en tête des données : « #1234|Nri1/CL5 ». */
         $data = preg_replace('/^#[0-9A-Fa-f]{1,16}\|?/', '', $data);
         $data = ltrim($data, '|');
-        $msg['data'] = $data;
+        $msg['data'] = self::clean($data);
+        $msg['content'] = self::clean($msg['content']);
 
         if ($msg['encrypted']) {
             if ($msg['timestamp'] === null) {
@@ -216,11 +229,26 @@ class AjaxSiaCodec {
         }
 
         if ($msg['type'] === 'SIA-DCS') {
-            $msg['events'] = self::parseSiaData($data);
+            $msg['events'] = self::parseSiaData($msg['data']);
         } elseif ($msg['type'] === 'ADM-CID') {
-            $msg['events'] = self::parseContactId($data);
+            $msg['events'] = self::parseContactId($msg['data']);
+        }
+        /* Accusé mais vide : sans ce signalement, un événement dont on n'a pas
+         * su lire les données disparaîtrait sans laisser de trace. */
+        if (empty($msg['events']) && in_array($msg['type'], array('SIA-DCS', 'ADM-CID'))) {
+            $msg['warning'] = trim($msg['warning'] . ' ; aucun événement lisible dans les données', ' ;');
         }
         return $msg;
+    }
+
+    /*
+     * Texte en UTF-8 valide et sans caractère de contrôle : il finit dans un
+     * JSON (journal, envoi à Jeedom) et dans des lignes de log, où un octet
+     * invalide ferait tout échouer et un saut de ligne fabriquerait une ligne.
+     */
+    public static function clean($_text) {
+        $text = mb_scrub((string) $_text, 'UTF-8');
+        return preg_replace('/[\x00-\x1F\x7F]/u', '?', $text);
     }
 
     /* Vrai si l'horodatage d'une trame chiffrée sort de la fenêtre admise. */
@@ -301,6 +329,8 @@ class AjaxSiaCodec {
         }
         $cid = self::dictionary('cid');
         $qualifier = ($m[1] === '6') ? '1' : $m[1];
+        /* Code absent de la table : '' ; le plugin publie alors l'événement
+         * sous son numéro Contact ID plutôt que de le taire. */
         $code = isset($cid[$m[2]][$qualifier]) ? $cid[$m[2]][$qualifier] : '';
         return array(array(
             'code' => $code,
@@ -349,9 +379,12 @@ class AjaxSiaCodec {
     }
 
     /*
-     * Déchiffre un contenu hexadécimal. Rend null si la clé est fausse : un
-     * texte déchiffré avec la mauvaise clé est du bruit binaire, alors qu'un
-     * contenu SIA n'est fait que de caractères imprimables et contient un « ] ».
+     * Déchiffre un contenu hexadécimal. Rend null si la clé est fausse.
+     *
+     * Le critère est la fin du texte : « ] », extensions éventuelles, puis
+     * l'horodatage, obligatoire dans une trame chiffrée. Avec une mauvaise clé,
+     * c'est du bruit binaire qui ne s'y conforme jamais. Le reste n'est pas
+     * examiné : le bourrage peut être binaire et un texte « ^…^ » accentué.
      */
     public static function decrypt($_hex, $_key) {
         $cipher = self::cipher($_key);
@@ -361,7 +394,7 @@ class AjaxSiaCodec {
         }
         $plain = openssl_decrypt(hex2bin($hex), $cipher, $_key,
                                  OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING, str_repeat("\0", 16));
-        if ($plain === false || !preg_match('/^[\x20-\x7E]*$/', $plain) || strpos($plain, ']') === false) {
+        if ($plain === false || !preg_match('/\][^\]]*(\[[^\]]*\])*_\d{2}:\d{2}:\d{2},\d{2}-\d{2}-\d{4}[\x00\s]*$/', $plain)) {
             return null;
         }
         return $plain;
@@ -405,8 +438,9 @@ class AjaxSiaCodec {
      * hubs Ajax.
      */
     public static function ack($_msg, $_time = null) {
+        $account = ($_msg['account_raw'] !== '') ? '#' . $_msg['account_raw'] : '';
         $head = '"' . ($_msg['encrypted'] ? '*' : '') . 'ACK"' . $_msg['seq'] . $_msg['receiver']
-              . ($_msg['line'] !== '' ? $_msg['line'] : 'L0') . '#' . $_msg['account'] . '[';
+              . ($_msg['line'] !== '' ? $_msg['line'] : 'L0') . $account . '[';
         if ($_msg['encrypted'] && $_msg['key'] !== null) {
             $body = $head . self::encrypt(']' . self::timestamp($_time), $_msg['key'], false, '0');
         } else {
