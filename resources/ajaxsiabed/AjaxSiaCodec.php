@@ -251,12 +251,14 @@ class AjaxSiaCodec {
         return preg_replace('/[\x00-\x1F\x7F]/u', '?', $text);
     }
 
-    /* Vrai si l'horodatage d'une trame chiffrée sort de la fenêtre admise. */
-    public static function outsideWindow($_msg, $_past = self::WINDOW_PAST, $_future = self::WINDOW_FUTURE) {
+    /* Vrai si l'horodatage d'une trame chiffrée sort de la fenêtre admise,
+     * centrée sur le décalage connu de l'horloge du hub ($_offset, en s). */
+    public static function outsideWindow($_msg, $_offset = 0, $_past = self::WINDOW_PAST, $_future = self::WINDOW_FUTURE) {
         if (!$_msg['encrypted'] || $_msg['skew'] === null) {
             return false;
         }
-        return ($_msg['skew'] < -$_past || $_msg['skew'] > $_future);
+        $skew = $_msg['skew'] - $_offset;
+        return ($skew < -$_past || $skew > $_future);
     }
 
     /*

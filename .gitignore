@@ -1,6 +1,8 @@
 # Fichiers propres à l'installation, jamais versionnés
 core/config/common.config.php
 data/journal/
+data/clock.json
+data/clock.json.tmp
 
 # Journaux et fichiers de processus
 *.log

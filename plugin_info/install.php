@@ -32,8 +32,28 @@ function ajaxsiabe_update() {
     foreach (eqLogic::byType('ajaxsiabe') as $eqLogic) {
         try {
             $eqLogic->save();
+            ajaxsiabe_restoreApostrophes($eqLogic);
         } catch (Throwable $e) {
             log::add('ajaxsiabe', 'error', $eqLogic->getHumanName() . ' : ' . $e->getMessage());
+        }
+    }
+}
+
+/* Jeedom retire l'apostrophe droite des noms de commandes : la version 0.2
+ * a créé « Type dalarme ». Les noms portent désormais l'apostrophe
+ * typographique ; on ne renomme que ce qui n'a pas été personnalisé. */
+function ajaxsiabe_restoreApostrophes($_eqLogic) {
+    $names = array(
+        'alarm_type'  => array('Type dalarme', 'Type d’alarme'),
+        'alarm_zone'  => array('Origine de lalarme', 'Origine de l’alarme'),
+        'reset_alarm' => array('Acquitter lalarme', 'Acquitter l’alarme'),
+    );
+    foreach ($names as $logicalId => $rename) {
+        $cmd = $_eqLogic->getCmd(null, $logicalId);
+        if (is_object($cmd) && $cmd->getName() === $rename[0]
+            && !is_object(cmd::byEqLogicIdCmdName($_eqLogic->getId(), $rename[1]))) {
+            $cmd->setName($rename[1]);
+            $cmd->save();
         }
     }
 }

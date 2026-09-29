@@ -63,14 +63,14 @@ class ajaxsiabe extends eqLogic {
         array('logicalId' => 'armed',        'name' => 'Armée',                  'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'ALARM_ENABLE_STATE'),
         array('logicalId' => 'arming_by',    'name' => 'Mode changé par',        'type' => 'info',   'subType' => 'string'),
         array('logicalId' => 'alarm',        'name' => 'Alarme',                 'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'ALARM_STATE', 'invert' => 1, 'initial' => 0, 'repeat' => 1),
-        array('logicalId' => 'alarm_type',   'name' => 'Type d\'alarme',         'type' => 'info',   'subType' => 'string'),
-        array('logicalId' => 'alarm_zone',   'name' => 'Origine de l\'alarme',   'type' => 'info',   'subType' => 'string'),
+        array('logicalId' => 'alarm_type',   'name' => 'Type d’alarme',          'type' => 'info',   'subType' => 'string'),
+        array('logicalId' => 'alarm_zone',   'name' => 'Origine de l’alarme',    'type' => 'info',   'subType' => 'string'),
         array('logicalId' => 'alarm_intrusion', 'name' => 'Alarme intrusion',    'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
         array('logicalId' => 'alarm_fire',   'name' => 'Alarme incendie',        'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'SMOKE', 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
         array('logicalId' => 'alarm_water',  'name' => 'Alarme inondation',      'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'FLOOD', 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
         array('logicalId' => 'alarm_gas',    'name' => 'Alarme gaz',             'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
         array('logicalId' => 'alarm_panic',  'name' => 'Alarme panique',         'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
-        array('logicalId' => 'reset_alarm',  'name' => 'Acquitter l\'alarme',    'type' => 'action', 'subType' => 'other'),
+        array('logicalId' => 'reset_alarm',  'name' => 'Acquitter l’alarme',     'type' => 'action', 'subType' => 'other'),
         array('logicalId' => 'tamper',       'name' => 'Sabotage',               'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'SABOTAGE', 'invert' => 1, 'initial' => 0),
         array('logicalId' => 'power',        'name' => 'Secteur',                'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'initial' => 1),
         array('logicalId' => 'battery_low',  'name' => 'Batterie faible',        'type' => 'info',   'subType' => 'binary', 'invert' => 1, 'initial' => 0),
@@ -926,7 +926,12 @@ class ajaxsiabe extends eqLogic {
     /*
      * Délai au-delà duquel un hub muet est déclaré perdu, en secondes. Réglé à
      * la main sur le hub, sinon déduit de la médiane des intervalles observés
-     * entre deux tests. 0 : pas encore de mesure, pas de supervision.
+     * entre deux tests. 0 : pas encore assez de mesures, pas de supervision.
+     *
+     * Trois intervalles au moins : sur le vrai hub, le premier test est parti
+     * juste après l'enregistrement des réglages dans Ajax PRO, hors de son
+     * calendrier. Un seul intervalle, trop court, donnerait un délai trop
+     * court et une fausse perte de liaison au test suivant.
      */
     public function supervisionDelay() {
         $manual = (int) $this->getConfiguration('supervision', 0);
@@ -934,7 +939,7 @@ class ajaxsiabe extends eqLogic {
             return $manual * 60;
         }
         $intervals = cache::byKey('ajaxsiabe::intervals::' . $this->getId())->getValue(array());
-        if (!is_array($intervals) || empty($intervals)) {
+        if (!is_array($intervals) || count($intervals) < 3) {
             return 0;
         }
         sort($intervals);
@@ -1022,7 +1027,7 @@ class ajaxsiabe extends eqLogic {
                 : (($daemon['state'] != 'ok') ? __('démon arrêté', __FILE__)
                     : __('port', __FILE__) . ' ' . $port . ' ' . __('non ouvert', __FILE__)
                       . (is_array($status) && !empty($status['listenError']) ? ' : ' . $status['listenError'] : '')),
-            'advice' => __('Le hub envoie ses messages sur ce port : sans lui, rien n arrive.', __FILE__),
+            'advice' => __('Le hub envoie ses messages sur ce port : sans lui, rien n’arrive.', __FILE__),
             'state'  => $listening,
         );
         if (is_array($status)) {
@@ -1045,7 +1050,7 @@ class ajaxsiabe extends eqLogic {
             'test'   => __('Chiffrement', __FILE__),
             'result' => empty($unencrypted) ? ((self::generalKey() !== '' || count($hubs) > 0) ? __('actif', __FILE__) : __('aucun hub', __FILE__))
                                             : __('absent pour', __FILE__) . ' ' . implode(', ', $unencrypted),
-            'advice' => __('Sans clé, n importe quel appareil du réseau peut envoyer un faux désarmement.', __FILE__),
+            'advice' => __('Sans clé, n’importe quel appareil du réseau peut envoyer un faux désarmement.', __FILE__),
             'state'  => empty($unencrypted),
         );
 

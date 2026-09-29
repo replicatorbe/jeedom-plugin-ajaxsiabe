@@ -53,7 +53,8 @@ l'adresse privée de Jeedom. La supervision de la liaison le signale.
      hexadécimaux ;
    - **Chiffrement** : recommandé, avec une clé de 16, 24 ou 32 caractères ;
    - **Intervalle de test (ping)** : court, de 1 à 5 minutes. C'est lui qui
-     règle la supervision de la liaison.
+     règle la supervision de la liaison, active après trois intervalles
+     mesurés (ou tout de suite avec un délai saisi sur le hub).
 4. Le hub apparaît dans le plugin dès son premier message (rechargez la
    page). Chaque appareil apparaît ensuite au premier événement qui le
    concerne. La création automatique s'arrête à cinq hubs et aux numéros
@@ -177,7 +178,7 @@ Motifs de refus :
 | En clair | Message non chiffré pour un compte dont la clé est connue : refusé, sans réponse. C'est ce qui empêche une machine du réseau de simuler un désarmement. |
 | Clé fausse | Message chiffré que ni la clé du hub ni la clé générale ne déchiffrent. |
 | Sans heure | Message chiffré sans horodatage, que la norme interdit. |
-| Mal daté | Message chiffré daté de plus de 40 s dans le passé ou de 20 s dans le futur. La norme l'impose pour empêcher le rejeu d'une trame capturée. Le refus donne l'heure au hub, qui se recale et renvoie son message. |
+| Mal daté | Message chiffré daté de plus de 40 s dans le passé ou de 20 s dans le futur. La norme l'impose pour empêcher le rejeu d'une trame capturée. Le refus donne l'heure au hub, qui se recale et renvoie son message. Un hub dont l'horloge avance ou retarde (de 2 minutes au plus) est mesuré sur ses messages : après trois mesures concordantes, la fenêtre est centrée sur son heure à lui. |
 | CRC faux, Illisible | Trame abîmée ou qui n'est pas du SIA DC-09. Une connexion qui en envoie cinq de suite est fermée. Une longueur annoncée fausse avec un CRC juste est acceptée et signalée par une icône. |
 | Refusé | Adresse absente de la liste des adresses autorisées. |
 | Doublon | Message réémis par le hub. Il reçoit un accusé de réception mais n'est traité qu'une fois. |

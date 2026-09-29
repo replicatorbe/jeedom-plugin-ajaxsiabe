@@ -6,5 +6,10 @@
 # effacerait tout l'historique des trames reçues.
 data/journal/
 
+# Décalage d'horloge appris par le démon pour chaque hub : sans cette ligne,
+# un déploiement le ferait réapprendre, messages refusés à la clé.
+data/clock.json
+data/clock.json.tmp
+
 # Jeux d'essai : outils de développement, inutiles côté Jeedom.
 tests/

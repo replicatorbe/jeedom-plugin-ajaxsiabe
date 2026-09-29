@@ -86,6 +86,12 @@ check('21 s dans le futur : hors fenêtre', AjaxSiaCodec::outsideWindow(AjaxSiaC
 $raw = AjaxSiaCodec::build('SIA-DCS', 2, '1234', 'Nri1/CL1', $key, 1000000 - 39);
 $frames = AjaxSiaCodec::extractFrames($raw);
 check('39 s dans le passé : accepté', !AjaxSiaCodec::outsideWindow(AjaxSiaCodec::parse($frames[0], $keys, 1000000)));
+/* Hub qui avance de 33 s (mesuré sur un vrai hub Ajax) : fenêtre recentrée. */
+$raw = AjaxSiaCodec::build('SIA-DCS', 2, '1234', 'Nri1/CL1', $key, 1000000 + 33);
+$m = AjaxSiaCodec::parse(AjaxSiaCodec::extractFrames($raw)[0], $keys, 1000000);
+check('+33 s sans correction : hors fenêtre', AjaxSiaCodec::outsideWindow($m));
+check('+33 s, horloge du hub +33 s : accepté', !AjaxSiaCodec::outsideWindow($m, 33));
+check('+33 s, horloge du hub -10 s : hors fenêtre', AjaxSiaCodec::outsideWindow($m, -10));
 $raw = AjaxSiaCodec::build('SIA-DCS', 2, '1234', 'Nri1/CL1', null, 1000000 - 3600);
 $frames = AjaxSiaCodec::extractFrames($raw);
 check('en clair : pas de fenêtre', !AjaxSiaCodec::outsideWindow(AjaxSiaCodec::parse($frames[0], null, 1000000)));

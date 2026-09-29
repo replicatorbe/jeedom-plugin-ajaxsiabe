@@ -114,6 +114,21 @@ class AjaxSiaDaemon {
 
     const MAX_PEERS = 64;            // émetteurs gardés dans les statistiques
 
+    /*
+     * Horloge des hubs. Le vrai hub avance de 33 s : la fenêtre de la norme
+     * (+20 s au plus) ferait refuser tous ses messages chiffrés, alarmes
+     * comprises. On mesure donc l'écart de chaque compte sur ses messages
+     * authentiques et on centre la fenêtre dessus. Correction seulement si
+     * l'horloge est stable (trois mesures concordantes) et l'écart raisonnable :
+     * au-delà, c'est la fenêtre de la norme qui s'applique. L'écart est gardé
+     * sur disque pour qu'un redémarrage ne le fasse pas réapprendre à coups
+     * de NAK.
+     */
+    const CLOCK_SAMPLES = 5;         // mesures gardées par compte
+    const CLOCK_MIN     = 3;         // mesures avant de corriger
+    const CLOCK_SPREAD  = 10;        // écart admis autour de la médiane, en s
+    const CLOCK_MAX     = 120;       // décalage au-delà duquel on ne corrige pas
+
     private $opt;
     private $config = array();
     private $tcp = null;
@@ -128,6 +143,7 @@ class AjaxSiaDaemon {
     private $pushQueue = array();
     private $pushPid = 0;
     private $dedup = array();
+    private $clock = null;           // compte => [séquence => écart], chargé à la demande
     private $noise = array();        // émetteur|motif => [début, nombre]
     private $reloadPending = false;
     private $running = true;
@@ -622,9 +638,17 @@ class AjaxSiaDaemon {
                 $replyName = 'ACK';
             }
         }
-        if ($status === 'ok' && AjaxSiaCodec::outsideWindow($msg) && $this->config['strict_time']) {
+        $offset = $this->clockOffset($msg['account']);
+        if ($status === 'ok' && AjaxSiaCodec::outsideWindow($msg, $offset) && $this->config['strict_time']) {
             $status = 'window';
-            $error = 'horodatage hors fenêtre (écart ' . $msg['skew'] . ' s)';
+            $error = 'horodatage hors fenêtre (écart ' . $msg['skew'] . ' s'
+                   . ($offset != 0 ? ', horloge du hub ' . sprintf('%+d', $offset) . ' s' : '') . ')';
+        }
+        /* Mesure sur les seuls messages authentiques : déchiffrés avec la clé
+         * (même hors fenêtre, sinon un hub décalé ne serait jamais appris), ou
+         * en clair pour un compte sans clé. */
+        if ($msg['status'] === 'ok' && ($msg['encrypted'] || $status === 'ok')) {
+            $this->clockSample($msg);
         }
         if ($status === 'ok') {
             $reply = AjaxSiaCodec::ack($msg);
@@ -668,6 +692,7 @@ class AjaxSiaDaemon {
             'data'    => $msg['data'],
             'xdata'   => array_map(array('AjaxSiaCodec', 'clean'), $msg['xdata']),
             'skew'    => $msg['skew'],
+            'offset'  => $offset,
             'events'  => $events,
             'raw'     => AjaxSiaCodec::clean(substr($msg['raw'], 0, self::RAW_MAX)),
         );
@@ -719,6 +744,70 @@ class AjaxSiaDaemon {
         }
         $this->dedup[$key] = $_now;
         return false;
+    }
+
+    /* --------------------------------------------------------------- horloge */
+
+    private function clockOffsets() {
+        $this->loadClock();
+        $offsets = array();
+        foreach (array_keys($this->clock) as $account) {
+            $offsets[$account] = $this->clockOffset((string) $account);
+        }
+        return $offsets;
+    }
+
+    private function clockFile() {
+        return __DIR__ . '/../../data/clock.json';
+    }
+
+    private function loadClock() {
+        if ($this->clock === null) {
+            $clock = json_decode((string) @file_get_contents($this->clockFile()), true);
+            $this->clock = is_array($clock) ? $clock : array();
+        }
+    }
+
+    /* Décalage à retrancher à l'écart d'un message de ce compte, en s. */
+    public function clockOffset($_account) {
+        $this->loadClock();
+        $samples = isset($this->clock[$_account]) && is_array($this->clock[$_account]) ? array_values($this->clock[$_account]) : array();
+        if (count($samples) < self::CLOCK_MIN) {
+            return 0;
+        }
+        sort($samples);
+        $median = (int) $samples[(int) floor(count($samples) / 2)];
+        /* Une mesure isolée (message mis en file pendant une coupure) ne doit
+         * pas annuler la correction : il suffit que la plupart concordent. */
+        $close = array_filter($samples, function ($_s) use ($median) { return abs($_s - $median) <= self::CLOCK_SPREAD; });
+        return (count($close) >= self::CLOCK_MIN && abs($median) <= self::CLOCK_MAX) ? $median : 0;
+    }
+
+    /*
+     * Une mesure par numéro de séquence : un hub qui réémet un message refusé,
+     * ou une trame rejouée en boucle, ne compte qu'une fois. Les tests de
+     * liaison, tous en séquence 0000, partagent une seule place.
+     */
+    private function clockSample($_msg) {
+        if ($_msg['skew'] === null || $_msg['account'] === '') {
+            return;
+        }
+        $this->loadClock();
+        $account = $_msg['account'];
+        $samples = isset($this->clock[$account]) && is_array($this->clock[$account]) ? $this->clock[$account] : array();
+        $seq = 's' . $_msg['seq'];
+        $before = $this->clockOffset($account);
+        unset($samples[$seq]);
+        $samples[$seq] = (int) $_msg['skew'];
+        $this->clock[$account] = array_slice($samples, -self::CLOCK_SAMPLES, null, true);
+        $after = $this->clockOffset($account);
+        if ($after !== $before) {
+            SiaLog::info('horloge du compte ' . $account . ' : ' . sprintf('%+d', $after) . ' s');
+        }
+        $data = json_encode($this->clock);
+        if (@file_put_contents($this->clockFile() . '.tmp', $data) === false || !@rename($this->clockFile() . '.tmp', $this->clockFile())) {
+            SiaLog::error('écriture impossible : ' . $this->clockFile());
+        }
     }
 
     /* -------------------------------------------------------------- journal */
@@ -940,6 +1029,7 @@ class AjaxSiaDaemon {
                     'wantUdp'     => $this->config['udp'],
                     'listenError' => $this->listenError,
                     'clients'     => count($this->clients),
+                    'clock'       => $this->clockOffsets(),
                 ));
         }
         return array('state' => 'error', 'result' => 'commande inconnue');

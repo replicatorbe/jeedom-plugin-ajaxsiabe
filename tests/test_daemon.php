@@ -192,6 +192,24 @@ check('deux trames dans un segment : deux ACK', substr_count($reply, '"ACK"') ==
 $reply = exchange(AjaxSiaCodec::build('SIA-DCS', 9, '1234', 'Nri1/TA4'), true);
 check('UDP : ACK', ackType($reply) === 'ACK');
 
+/* Hub en avance de 33 s : refusé tant que son horloge n'est pas connue,
+ * accepté ensuite. Une réémission ne compte que pour une mesure. */
+$ahead = time() + 33;
+$replies = array();
+foreach (array(30, 30, 30, 31, 32) as $seq) {
+    $replies[] = ackType(exchange(AjaxSiaCodec::build('SIA-DCS', $seq, '5A5A', 'Nri1/CL' . $seq, $key, time() + 33)));
+}
+check('hub en avance : NAK tant que trois mesures distinctes manquent', $replies === array('NAK', 'NAK', 'NAK', 'NAK', 'NAK'));
+check('hub en avance : accepté une fois son horloge apprise',
+      ackType(exchange(AjaxSiaCodec::build('SIA-DCS', 33, '5A5A', 'Nri1/OP33', $key, time() + 33))) === '*ACK');
+check('hub en avance : un message vieux de 60 s reste refusé',
+      ackType(exchange(AjaxSiaCodec::build('SIA-DCS', 34, '5A5A', 'Nri1/OP34', $key, time() - 60))) === 'NAK');
+check('hub en avance : une mesure isolée ne défait pas la correction',
+      ackType(exchange(AjaxSiaCodec::build('SIA-DCS', 35, '5A5A', 'Nri1/OP35', $key, time() + 33))) === '*ACK');
+$status = order('status');
+check('état : horloge du hub +33 s', isset($status['result']['clock']['5A5A']) && abs($status['result']['clock']['5A5A'] - 33) <= 1);
+check('horloge gardée sur disque', strpos((string) @file_get_contents($dir . '/p/data/clock.json'), '5A5A') !== false);
+
 /* Connexions muettes : elles ne doivent pas rendre le récepteur sourd. */
 $mute = array();
 for ($i = 0; $i < 40; $i++) {
