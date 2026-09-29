@@ -57,24 +57,41 @@ l'adresse privée de Jeedom. La supervision de la liaison le signale.
      mesurés (ou tout de suite avec un délai saisi sur le hub).
 4. Le hub apparaît dans le plugin dès son premier message (rechargez la
    page). Chaque appareil apparaît ensuite au premier événement qui le
-   concerne. La création automatique s'arrête à cinq hubs et aux numéros
-   d'appareil de 1 à 999 ; au-delà, créez l'équipement à la main.
+   concerne. La création automatique s'arrête à cinq hubs ; au-delà, ou si
+   « Créer les hubs inconnus » est décoché, ajoutez le hub à la main avec le
+   bouton **Ajouter** et son numéro de compte. Les appareils (zones), eux, ne
+   se créent pas à la main : ils naissent à leur premier événement, ou par le
+   bouton **Nommer la zone** du journal.
 
 La page du plugin affiche en permanence l'état du récepteur : port ouvert,
 nombre de trames reçues, heure du dernier message de chaque hub.
+
+### Configuration du plugin
+
+| Réglage | Rôle |
+|---|---|
+| Port de réception | Port sur lequel les hubs envoient leurs messages (7777 par défaut, TCP). |
+| Écouter aussi en UDP | Inutile pour Ajax, qui émet en TCP. En UDP, l'adresse d'un émetteur peut être usurpée. |
+| Clé de chiffrement | La clé générale : elle sert aux hubs qui n'ont pas la leur. Dès qu'une clé s'applique à un hub, ses messages en clair sont refusés. |
+| Refuser les messages mal datés | Coché par défaut, et à laisser coché : c'est la protection de la norme contre le rejeu d'une trame capturée. Une horloge de hub qui avance ou retarde de façon stable (2 minutes au plus) est mesurée et corrigée d'elle-même. Ne décocher que si le journal montre des refus « Mal daté » répétés. |
+| Adresses autorisées | Adresses IP exactes des hubs, séparées par des virgules : ni plage, ni masque, ni nom d'hôte (une entrée invalide est refusée à l'enregistrement). Vide : tout émetteur est accepté. |
+| Créer les hubs inconnus | Crée un hub au premier message d'un numéro de compte inconnu, cinq au plus. Décoché, ces messages sont accusés et gardés au journal, et le hub se crée à la main. |
+| Journal conservé | Nombre de jours de journal SIA gardés, 50 Mo par jour au plus. |
+| Port des ordres | Port local (127.0.0.1) par lequel Jeedom parle au démon. À changer seulement en cas de conflit, puis redémarrer le démon. |
 
 ## Équipements
 
 ### Hub
 
 Il est créé au premier message d'un numéro de compte inconnu. Vous pouvez aussi
-le créer à la main avant de configurer Ajax.
+le créer à la main (bouton **Ajouter**) avant de configurer Ajax : un
+équipement ajouté à la main est toujours un hub.
 
 | Réglage | Rôle |
 |---|---|
 | Numéro de compte | Le numéro d'objet saisi dans Ajax PRO (3 à 16 caractères hexadécimaux selon la norme ; Jeedom en accepte de 1 à 16). |
 | Clé de chiffrement | La clé propre à ce hub, stockée chiffrée. Vide, c'est la clé générale du plugin qui sert. |
-| Liaison perdue après | En minutes. Vide : le délai vaut 2,5 fois l'intervalle médian mesuré entre les tests de liaison, plus 30 s, et jamais moins de trois minutes. Aucune perte n'est déclarée tant que le démon est arrêté : c'est alors le récepteur qui est sourd, pas le hub. |
+| Liaison perdue après | En minutes. Vide : le délai vaut 2,5 fois l'intervalle médian mesuré entre les tests de liaison, plus 30 s, et jamais moins de trois minutes ; il faut trois intervalles mesurés (quatre tests) avant qu'il s'applique. Aucune perte n'est déclarée tant que le démon est arrêté : c'est alors le récepteur qui est sourd, pas le hub. |
 | Créer les appareils | Crée une zone au premier événement d'un appareil. |
 | Utilisateurs | Une ligne par utilisateur : `numéro=nom`. Exemple : `1=Jérôme`. Le journal montre le numéro transmis à chaque armement. |
 | Groupes | En mode groupes seulement : `numéro=nom`, un par ligne. Déclarer les groupes active le suivi du mode groupe par groupe ; sans groupe déclaré, tout armement vaut pour le système entier. |
@@ -85,15 +102,17 @@ le créer à la main avant de configurer Ajax.
 | Armée | 1 si le système est armé, partiellement armé ou en mode nuit. |
 | Mode changé par | Nom de l'utilisateur ou de l'appareil ; à défaut le nom du groupe, ou « le système » pour un changement automatique. |
 | Alarme | 1 tant qu'une alarme est en cours. Chaque nouvelle alarme redéclenche les scénarios, même si une autre était déjà en cours. |
-| Type d'alarme | Intrusion, Incendie, Inondation, Gaz, Panique… |
-| Origine de l'alarme | Nom de la zone qui a déclenché. |
+| Type d’alarme | Intrusion, Incendie, Inondation, Gaz, Panique… |
+| Origine de l’alarme | Nom de la zone qui a déclenché. |
 | Alarme intrusion, incendie, inondation, gaz, panique | Une commande binaire par famille, masquée par défaut : 1 tant qu'une alarme de cette famille est en cours. Incendie couvre aussi la chaleur et le sprinkler, inondation le gel, panique l'agression, la contrainte, l'urgence et le médical. |
-| Acquitter l'alarme | Remet l'alarme à zéro côté Jeedom. |
+| Acquitter l’alarme | Remet l'alarme à zéro côté Jeedom. |
+| Réinitialiser les défauts | Remet au repos sabotages, batteries, liaisons des appareils, brouillage et secteur, par exemple quand un rétablissement a été perdu pendant un arrêt de Jeedom. Un défaut toujours présent revient au prochain message du hub. Masquée par défaut. |
 | Sabotage | 1 tant qu'au moins un sabotage est en cours. |
 | Secteur | 0 pendant une coupure de courant. |
 | Batterie faible | 1 tant qu'au moins une batterie est faible, hub compris. |
 | Brouillage | 1 pendant un brouillage radio. |
 | Liaison | 0 quand le hub se tait au-delà du délai de supervision. |
+| Appareil injoignable | 1 tant qu'un appareil du hub a perdu sa liaison (même sans équipement de zone). |
 | Dernier contact | Date du dernier message reçu, test de liaison compris. |
 | Dernier utilisateur | Nom de l'utilisateur du dernier événement, vide s'il n'en concerne aucun. Masquée par défaut. |
 | Dernière zone | Nom de l'appareil du dernier événement, vide s'il n'en concerne aucun. Masquée par défaut. |
@@ -103,20 +122,24 @@ le créer à la main avant de configurer Ajax.
 
 **Fin d'une alarme.**
 
-- Les alarmes d'intrusion, de porte forcée, de sortie, de panique,
-  d'agression, de contrainte, médicale et d'urgence restent actives jusqu'au
-  désarmement complet, à leur annulation ou à l'acquittement : qu'une porte
-  se referme ne prouve pas que l'intrus est reparti. Reçues en mode désarmé,
-  elles restent aussi actives jusqu'au désarmement suivant ou à
-  l'acquittement.
+- Les alarmes d'intrusion (porte forcée et sortie comprises) restent
+  actives jusqu'au désarmement complet, à leur annulation ou à
+  l'acquittement : qu'une porte se referme ne prouve pas que l'intrus est
+  reparti.
+- Les alarmes de panique, d'agression, de contrainte, médicale et
+  d'urgence restent actives jusqu'à leur annulation, au « système rétabli
+  après alarme » d'Ajax ou à l'acquittement. Le désarmement ne les efface
+  pas : un désarmement sous contrainte arrive justement avec son
+  désarmement.
 - Les alarmes techniques (incendie, chaleur, eau, gaz, gel, sprinkler)
-  retombent quand leur détecteur revient au repos. Désarmer ne les efface
-  pas : désarmer n'éteint pas un incendie.
+  retombent quand leur détecteur revient au repos, chacune avec son propre
+  rétablissement (un détecteur fumée et CO peut signaler les deux).
+  Désarmer ne les efface pas : désarmer n'éteint pas un incendie.
 - Désarmer un seul groupe n'efface rien.
 - Sur une zone, « Alarme » repasse à 0 dès que le détecteur revient au
   repos ; c'est le hub qui garde la mémoire.
-- Quand plusieurs alarmes sont en cours, « Type d'alarme » et « Origine de
-  l'alarme » montrent la plus récente encore active.
+- Quand plusieurs alarmes sont en cours, « Type d’alarme » et « Origine de
+  l’alarme » montrent la plus récente encore active.
 
 **Nouvel événement.** « Dernier événement », « Dernier code SIA » et
 « Catégorie du dernier événement » déclenchent les scénarios même quand la
@@ -140,7 +163,7 @@ se manifeste. De même si le récepteur ne parvient pas à ouvrir son port.
 
 Une zone correspond à un appareil Ajax, identifié par son numéro dans le hub.
 Elle est créée sous le nom « Zone N ». **Renommez-la d'après l'appareil** :
-son nom sert ensuite dans les événements et dans « Origine de l'alarme ».
+son nom sert ensuite dans les événements et dans « Origine de l’alarme ».
 
 Commandes : Alarme, Sabotage, Batterie faible, Liaison, Dernier événement.
 Tout événement venu de l'appareil remet sa liaison à 1, sauf celui qui en

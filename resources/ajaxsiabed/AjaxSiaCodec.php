@@ -186,7 +186,16 @@ class AjaxSiaCodec {
              * hub répète en tête : c'est sûr même si un bourrage binaire
              * contient « | » ou « ] ». À défaut, la norme exclut ces caractères
              * du bourrage : tout ce qui précède le premier est jeté. */
-            $marker = ($msg['account_raw'] !== '') ? strpos($plain, '#' . $msg['account_raw'] . '|') : false;
+            $marker = ($msg['account_raw'] !== '') ? stripos($plain, '#' . $msg['account_raw'] . '|') : false;
+            /* Le compte de l'en-tête circule en clair et n'est protégé que par
+             * le CRC : une trame d'un autre hub partageant la même clé, en-tête
+             * réécrit, lui serait attribuée. Le compte chiffré fait foi. */
+            if ($marker === false && preg_match('/^[^|\[\]]*\|?#([0-9A-Fa-f]{1,16})\|/', $plain, $other)
+                && strtoupper($other[1]) !== $msg['account']) {
+                $msg['status'] = 'decrypt';
+                $msg['error'] = 'compte chiffré (' . strtoupper($other[1]) . ') différent de celui de l\'en-tête';
+                return $msg;
+            }
             $rest = ($marker !== false) ? substr($plain, $marker) : preg_replace('/^[^|\[\]]*\|?/', '', $plain);
         }
         $msg['content'] = $rest;

@@ -60,11 +60,11 @@ function ajaxsiabeAgo(_seconds) {
 
 /* Affiche le bloc de configuration du type d'équipement. */
 function ajaxsiabeToggleType() {
-  var select = document.getElementById('sel_ajaxsiabeType')
-  if (select === null) {
+  var type = document.getElementById('in_ajaxsiabeType')
+  if (type === null) {
     return
   }
-  var zone = (select.value === 'zone')
+  var zone = (type.value === 'zone')
   document.querySelectorAll('.ajaxsiabeHubBlock').forEach(function (el) {
     el.style.display = zone ? 'none' : ''
   })
@@ -92,7 +92,9 @@ function ajaxsiabeBanner(_css, _lines) {
 }
 
 /* Bandeau d'état du récepteur, sur la page des équipements. Interrogé
-   seulement quand il est visible : pas pendant l'édition d'un équipement. */
+   seulement quand il est visible (pas pendant l'édition d'un équipement, ni
+   onglet caché), et jamais deux fois à la fois : un Jeedom lent ne doit pas
+   voir les requêtes s'empiler. */
 function ajaxsiabeRefreshStatus() {
   var box = document.getElementById('div_ajaxsiabeStatus')
   if (box === null) {
@@ -102,10 +104,26 @@ function ajaxsiabeRefreshStatus() {
     }
     return
   }
-  if (box.offsetParent === null) {
+  if (box.offsetParent === null || document.hidden || window.ajaxsiabeStatusBusy) {
     return
   }
+  window.ajaxsiabeStatusBusy = true
+  /* Une erreur fatale côté serveur n'appelle ni success ni error : sans ce
+     délai, le bandeau tournerait indéfiniment. */
+  var answered = false
+  var watchdog = setTimeout(function () {
+    if (!answered) {
+      window.ajaxsiabeStatusBusy = false
+      ajaxsiabeBanner('info', [['fa-question-circle', '{{État du récepteur inconnu : Jeedom ne répond pas.}}']])
+    }
+  }, 15000)
+  var settle = function () {
+    answered = true
+    clearTimeout(watchdog)
+    window.ajaxsiabeStatusBusy = false
+  }
   ajaxsiabeAjax('status', {}, function (result) {
+    settle()
     if (result.daemon != 'ok') {
       ajaxsiabeBanner('danger', [['fa-exclamation-triangle', '{{Récepteur arrêté : aucun message ne peut être reçu. Démarrez le démon depuis la page du plugin.}}']])
       return
@@ -161,6 +179,7 @@ function ajaxsiabeRefreshStatus() {
     }
     ajaxsiabeBanner(css, lines)
   }, function (_message) {
+    settle()
     ajaxsiabeBanner('info', [['fa-question-circle', '{{État du récepteur inconnu :}} ' + _message]])
   })
 }
@@ -187,20 +206,13 @@ function ajaxsiabeShowSupervision(_eqLogic) {
         var delay = result.hubs[i].supervision
         span.textContent = (delay > 0)
           ? '{{Délai appliqué :}} ' + ajaxsiabeAgo(delay) + '.'
-          : '{{Pas encore de délai : il faut deux tests de liaison pour mesurer leur intervalle.}}'
+          : '{{Pas encore de délai : il faut trois intervalles entre tests de liaison (quatre tests) pour le mesurer.}}'
       }
     }
   })
 }
 
 function printEqLogic(_eqLogic) {
-  var saved = isset(_eqLogic) && isset(_eqLogic.id) && _eqLogic.id != ''
-  /* Le type se choisit à la création : ensuite, un hub changé en appareil
-     perdrait ses zones. */
-  var typeRow = document.getElementById('div_ajaxsiabeType')
-  if (typeRow !== null) {
-    typeRow.style.display = saved ? 'none' : ''
-  }
   /* Le coeur ne touche pas une case à cocher dont la clé est absente : elle
      garderait l'état de l'équipement ouvert avant. */
   var configuration = (isset(_eqLogic) && isset(_eqLogic.configuration)) ? _eqLogic.configuration : {}
@@ -218,8 +230,11 @@ function ajaxsiabeCopy(_text) {
   var done = function () {
     jeedomUtils.showAlert({ message: '{{Copié :}} ' + _text, level: 'success' })
   }
+  var warn = function () {
+    jeedomUtils.showAlert({ message: '{{Copie impossible, sélectionnez la valeur à la main.}}', level: 'warning' })
+  }
   if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(_text).then(done)
+    navigator.clipboard.writeText(_text).then(done, warn)
     return
   }
   var area = document.createElement('textarea')
@@ -228,13 +243,19 @@ function ajaxsiabeCopy(_text) {
   area.style.opacity = '0'
   document.body.appendChild(area)
   area.select()
+  /* execCommand renvoie false sans lever d'exception quand il échoue. */
+  var copied = false
   try {
-    document.execCommand('copy')
-    done()
+    copied = document.execCommand('copy')
   } catch {
-    jeedomUtils.showAlert({ message: '{{Copie impossible, sélectionnez la valeur à la main.}}', level: 'warning' })
+    copied = false
   }
   document.body.removeChild(area)
+  if (copied) {
+    done()
+  } else {
+    warn()
+  }
 }
 
 /* Assistant de raccordement : valeurs à recopier dans Ajax PRO. */
@@ -246,9 +267,6 @@ function ajaxsiabeLoadConnection() {
   }
   ajaxsiabeAjax('connection', {}, function (result) {
     ajaxsiabeConnection = result
-    if (!result.ip) {
-      ajaxsiabeConnection.ip = '{{à régler dans Réglages → Système → Configuration → Réseaux}}'
-    }
     ajaxsiabeShowConnection()
   })
 }
@@ -263,9 +281,14 @@ function ajaxsiabeShowConnection() {
   if (button !== null) {
     button.querySelector('span').textContent = ajaxsiabeConnection.key ? '{{Remplacer}}' : '{{Générer une clé}}'
   }
-  var copyKey = document.querySelector('.bt_ajaxsiabeCopy[data-field="key"]')
-  if (copyKey !== null) {
-    copyKey.style.display = ajaxsiabeConnection.key ? '' : 'none'
+  /* Rien à copier : ni bouton, ni texte d'aide pris pour une valeur. */
+  document.querySelectorAll('.bt_ajaxsiabeCopy').forEach(function (el) {
+    var value = ajaxsiabeConnection[el.getAttribute('data-field')]
+    el.style.display = (value === undefined || value === '' || value === null) ? 'none' : ''
+  })
+  var noIp = document.getElementById('span_ajaxsiabeNoIp')
+  if (noIp !== null) {
+    noIp.style.display = ajaxsiabeConnection.ip ? 'none' : ''
   }
 }
 
@@ -294,14 +317,22 @@ function ajaxsiabeGenerateKey() {
 /* Les pages sont chargées en AJAX : DOMContentLoaded a déjà eu lieu, les
    écouteurs sont posés à la racine du script. */
 var ajaxsiabeContainer = document.getElementById('div_pageContainer') || document.body
-ajaxsiabeContainer.addEventListener('change', function (event) {
-  if (event.target.closest('#sel_ajaxsiabeType')) {
-    ajaxsiabeToggleType()
+function ajaxsiabeToggleConnect() {
+  var body = document.getElementById('div_ajaxsiabeConnectBody')
+  var open = (body.style.display === 'none')
+  body.style.display = open ? '' : 'none'
+  document.getElementById('bt_ajaxsiabeConnectToggle').setAttribute('aria-expanded', open ? 'true' : 'false')
+}
+ajaxsiabeContainer.addEventListener('keydown', function (event) {
+  if ((event.key === 'Enter' || event.key === ' ') && event.target.closest('#bt_ajaxsiabeConnectToggle')) {
+    event.preventDefault()
+    ajaxsiabeToggleConnect()
   }
 })
 ajaxsiabeContainer.addEventListener('click', function (event) {
   var copy = event.target.closest('.bt_ajaxsiabeCopy')
   if (copy !== null) {
+    event.preventDefault()
     var value = ajaxsiabeConnection[copy.getAttribute('data-field')]
     if (value !== undefined && value !== '') {
       ajaxsiabeCopy(String(value))
@@ -309,24 +340,27 @@ ajaxsiabeContainer.addEventListener('click', function (event) {
     return
   }
   if (event.target.closest('#bt_ajaxsiabeGenerateKey')) {
+    event.preventDefault()
     ajaxsiabeGenerateKey()
     return
   }
   if (event.target.closest('#bt_ajaxsiabeConnectToggle')) {
-    var body = document.getElementById('div_ajaxsiabeConnectBody')
-    body.style.display = (body.style.display === 'none') ? '' : 'none'
+    ajaxsiabeToggleConnect()
   }
 })
 
 var ajaxsiabeConnectBody = document.getElementById('div_ajaxsiabeConnectBody')
-if (ajaxsiabeConnectBody !== null && ajaxsiabeConnectBody.getAttribute('data-open') === '1') {
-  ajaxsiabeConnectBody.style.display = ''
+if (ajaxsiabeConnectBody !== null) {
+  var ajaxsiabeConnectOpen = (ajaxsiabeConnectBody.getAttribute('data-open') === '1')
+  ajaxsiabeConnectBody.style.display = ajaxsiabeConnectOpen ? '' : 'none'
+  document.getElementById('bt_ajaxsiabeConnectToggle').setAttribute('aria-expanded', ajaxsiabeConnectOpen ? 'true' : 'false')
 }
 ajaxsiabeLoadConnection()
 
 if (window.ajaxsiabeStatusTimer) {
   clearInterval(window.ajaxsiabeStatusTimer)
 }
+window.ajaxsiabeStatusBusy = false
 ajaxsiabeRefreshStatus()
 window.ajaxsiabeStatusTimer = setInterval(ajaxsiabeRefreshStatus, 10000)
 

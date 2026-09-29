@@ -21,11 +21,19 @@ function ajaxsiabe_install() {
     ajaxsiabe_prepareData();
     /* Le démon appelle toujours le callback depuis 127.0.0.1 : restreindre l'API
      * du plugin à la boucle locale ne gêne rien et évite qu'elle réponde au LAN. */
+    ajaxsiabe_apiLocalOnly();
+}
+
+/* La clé du plugin d'abord : créée plus tard, par le premier démarrage du
+ * démon, elle remettrait le mode d'accès à « activé ». */
+function ajaxsiabe_apiLocalOnly() {
+    jeedom::getApiKey('ajaxsiabe');
     config::save('api::ajaxsiabe::mode', 'localhost', 'core');
 }
 
 function ajaxsiabe_update() {
     ajaxsiabe_prepareData();
+    ajaxsiabe_apiLocalOnly();
     /* Recrée les commandes ajoutées par une nouvelle version, et chiffre les
      * clés des hubs enregistrées en clair par la version 0.1. Un équipement
      * qui refuse de s'enregistrer ne doit pas interrompre la mise à jour. */

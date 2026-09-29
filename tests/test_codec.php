@@ -203,7 +203,20 @@ check('Ajax : NC = mode nuit par scénario', AjaxSiaCodec::describe('NC')['e']['
 check('Ajax : NP porte un utilisateur, pas une zone', AjaxSiaCodec::describe('NP')['a'] === 'u');
 check('Ajax : AF ne crée pas de zone', AjaxSiaCodec::describe('AF')['a'] !== 'z');
 check('Ajax : OR acquitte, ne désarme pas', !isset(AjaxSiaCodec::describe('OR')['e']['arm']) && AjaxSiaCodec::describe('OR')['e']['cancel'] === 'latched');
-check('Ajax : YA = batterie reconnectée', AjaxSiaCodec::describe('YA')['e']['battery'] === 0);
+check('Ajax : YA = batterie reconnectée', AjaxSiaCodec::describe('YA')['e']['battery_missing'] === 0);
+check('rétablissement typé : GH ne retire que le gaz', AjaxSiaCodec::describe('GH')['e']['restore'] === 'Gaz');
+check('rétablissement typé : BR retire l\'intrusion', AjaxSiaCodec::describe('BR')['e']['restore'] === 'Intrusion');
+check('Contact ID 3423 (fin de contrainte) ne relance pas l\'alarme', AjaxSiaCodec::parseContactId('3423 01 005')[0]['code'] === '');
+check('YX : appareil injoignable', AjaxSiaCodec::describe('YX')['e']['link'] === 0);
+
+/* Compte chiffré différent de celui de l'en-tête : refusé. */
+$raw = AjaxSiaCodec::build('SIA-DCS', 7, 'BBBB', 'Nri1/OP5', $key, 1000000);
+$buffer = str_replace('#BBBB[', '#AAAA[', $raw);
+$forged = AjaxSiaCodec::extractFrames($buffer)[0];
+$body = substr($forged, 8);
+$forged = AjaxSiaCodec::crc($body) . substr($forged, 4);
+$m = AjaxSiaCodec::parse($forged, function () use ($key) { return array($key); }, 1000000);
+check('en-tête réécrit vers un autre compte : refusé', $m['status'] === 'decrypt');
 check('Contact ID inconnu : code vide, numéro gardé', AjaxSiaCodec::parseContactId('1999 01 001')[0]['code'] === '' && AjaxSiaCodec::parseContactId('1999 01 001')[0]['cid'] === '1999');
 
 /* Dictionnaire. */

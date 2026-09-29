@@ -40,16 +40,16 @@ $internalAddr = config::byKey('internalAddr', 'core', '');
 				<input type="checkbox" class="configKey" data-l1key="strict_time">
 			</div>
 			<div class="col-md-5">
-				<span class="help-block" style="margin:0;">{{Conforme à la norme : un message chiffré daté de plus de 40 s dans le passé ou 20 s dans le futur est refusé, ce qui empêche de rejouer une trame capturée. Le refus donne l'heure au hub, qui se recale et renvoie. Décocher seulement si le journal montre des refus répétés pour ce motif.}}</span>
+				<span class="help-block" style="margin:0;">{{Conforme à la norme : un message chiffré daté de plus de 40 s dans le passé ou 20 s dans le futur est refusé, ce qui empêche de rejouer une trame capturée. Une horloge de hub qui avance ou retarde de façon stable (2 min au plus) est mesurée et corrigée d'elle-même. Décocher seulement si le journal montre des refus répétés pour ce motif : c'est renoncer à la protection contre le rejeu.}}</span>
 			</div>
 		</div>
 		<div class="form-group">
 			<label class="col-md-4 control-label">{{Adresses autorisées}}</label>
 			<div class="col-md-3">
-				<input class="configKey form-control" data-l1key="allowed" placeholder="{{toutes}}">
+				<input class="configKey form-control" data-l1key="allowed" placeholder="{{toutes, ex. 192.168.0.104}}">
 			</div>
 			<div class="col-md-4">
-				<span class="help-block" style="margin:0;">{{Adresses IP des hubs, séparées par des virgules. Vide : tout émetteur est accepté. Les refus figurent au journal, résumés par minute et par émetteur.}}</span>
+				<span class="help-block" style="margin:0;">{{Adresses IP exactes des hubs, séparées par des virgules (ni plage, ni masque, ni nom : une entrée invalide est refusée à l'enregistrement). Vide : tout émetteur est accepté. Les refus figurent au journal, résumés par minute et par émetteur.}}</span>
 			</div>
 		</div>
 	</fieldset>

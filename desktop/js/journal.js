@@ -33,6 +33,10 @@ var ajaxsiabeJournalStatus = {
 var ajaxsiabeJournalRequest = 0
 var ajaxsiabeJournalSignature = ''
 var ajaxsiabeJournalErrorShown = false
+/* Requête en cours (numéro), et depuis quand : le rafraîchissement en direct
+   attend sa réponse au lieu d'empiler les requêtes sur un Jeedom lent. */
+var ajaxsiabeJournalBusy = 0
+var ajaxsiabeJournalBusySince = 0
 
 function ajaxsiabeJournalCell(_row, _text, _className) {
   var td = document.createElement('td')
@@ -144,6 +148,7 @@ function ajaxsiabeJournalRender(_result) {
     var key = ajaxsiabeJournalKey(entry)
     var row = document.createElement('tr')
     row.style.cursor = 'pointer'
+    row.tabIndex = 0
     ajaxsiabeJournalCell(row, entry.time || '')
     ajaxsiabeJournalCell(row, entry.hub ? entry.hub : (entry.account ? '#' + entry.account : (entry.peer || '')), 'hidden-xs')
     ajaxsiabeJournalCell(row, entry.text || entry.error || '')
@@ -217,6 +222,8 @@ function ajaxsiabeJournalNameButtons(_cell, _entry) {
       seen[key] = true
       var button = document.createElement('a')
       button.className = 'btn btn-xs btn-default bt_ajaxsiabeName'
+      button.href = '#'
+      button.setAttribute('role', 'button')
       button.style.marginRight = '5px'
       button.setAttribute('data-kind', t.kind)
       button.setAttribute('data-number', t.number)
@@ -255,8 +262,8 @@ function ajaxsiabeJournalName(_button) {
         dataType: 'json',
         global: false,
         noDisplayError: true,
-        error: function (request, status, error) {
-          domUtils.handleAjaxError(request, status, error)
+        error: function () {
+          jeedomUtils.showAlert({ message: '{{Enregistrement impossible : Jeedom ne répond pas, ou la session a expiré.}}', level: 'danger' })
         },
         success: function (data) {
           if (data.state != 'ok') {
@@ -275,6 +282,7 @@ function ajaxsiabeJournalName(_button) {
 function ajaxsiabeJournalToggle(event) {
   var name = event.target.closest('.bt_ajaxsiabeName')
   if (name !== null) {
+    event.preventDefault()
     ajaxsiabeJournalName(name)
     return
   }
@@ -298,6 +306,13 @@ function ajaxsiabeJournalLoad(_force) {
   /* Chaque requête est numérotée : une réponse arrivée après une plus récente
      (changement de filtre pendant un rafraîchissement) est ignorée. */
   var request = ++ajaxsiabeJournalRequest
+  ajaxsiabeJournalBusy = request
+  ajaxsiabeJournalBusySince = Date.now()
+  var settle = function () {
+    if (ajaxsiabeJournalBusy === request) {
+      ajaxsiabeJournalBusy = 0
+    }
+  }
   domUtils.ajax({
     type: 'POST',
     url: 'plugins/ajaxsiabe/core/ajax/ajaxsiabe.ajax.php',
@@ -313,9 +328,11 @@ function ajaxsiabeJournalLoad(_force) {
     global: false,
     noDisplayError: true,
     error: function () {
+      settle()
       ajaxsiabeJournalError('{{Journal injoignable : la session a peut-être expiré.}}')
     },
     success: function (data) {
+      settle()
       if (request !== ajaxsiabeJournalRequest) {
         return
       }
@@ -360,7 +377,12 @@ function ajaxsiabeJournalTick() {
   }
   var live = document.getElementById('cb_ajaxsiabeLive')
   var date = document.getElementById('sel_ajaxsiabeDate')
-  if (!live.checked || date.value !== '') {
+  if (!live.checked || date.value !== '' || document.hidden) {
+    return
+  }
+  /* Une erreur fatale côté serveur n'appelle ni success ni error : au-delà
+     de 30 s, la requête est tenue pour perdue. */
+  if (ajaxsiabeJournalBusy !== 0 && Date.now() - ajaxsiabeJournalBusySince < 30000) {
     return
   }
   var selection = window.getSelection ? String(window.getSelection()) : ''
@@ -388,11 +410,19 @@ if (ajaxsiabeJournalRoot !== null) {
     }
   })
   ajaxsiabeJournalRoot.addEventListener('click', ajaxsiabeJournalToggle)
+  /* Au clavier : Entrée sur une ligne ouvre son détail. */
+  ajaxsiabeJournalRoot.addEventListener('keydown', function (event) {
+    if (event.key === 'Enter' && event.target.matches('#table_ajaxsiabeJournal tbody tr')) {
+      event.preventDefault()
+      ajaxsiabeJournalToggle(event)
+    }
+  })
 }
 
 if (window.ajaxsiabeJournalTimer) {
   clearInterval(window.ajaxsiabeJournalTimer)
 }
+ajaxsiabeJournalBusy = 0
 ajaxsiabeJournalLiveState()
 ajaxsiabeJournalLoad(true)
 window.ajaxsiabeJournalTimer = setInterval(ajaxsiabeJournalTick, 3000)

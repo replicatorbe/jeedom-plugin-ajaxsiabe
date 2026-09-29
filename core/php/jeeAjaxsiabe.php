@@ -25,7 +25,16 @@
 require_once __DIR__ . '/../../../../core/php/core.inc.php';
 require_once __DIR__ . '/../class/ajaxsiabe.class.php';
 
-if (!jeedom::apiAccess(init('apikey'), 'ajaxsiabe')) {
+/*
+ * Seul le démon, sur la même machine, avec la clé API du plugin. Pas
+ * jeedom::apiAccess() : il accepte aussi la clé personnelle de n'importe quel
+ * utilisateur, et son contrôle « localhost » lit X-Real-IP, qu'un client
+ * choisit. Ce point d'entrée donne les clés AES et fait désarmer le hub
+ * dans Jeedom : l'adresse est lue sur la connexion elle-même.
+ */
+$remote = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
+$local = in_array($remote, array('127.0.0.1', '::1', '::ffff:127.0.0.1'), true);
+if (!$local || !hash_equals((string) jeedom::getApiKey('ajaxsiabe'), (string) init('apikey'))) {
     /* 401 et non 200 : le démon ne dispose que du code HTTP pour savoir si son
      * lot a été pris en compte. */
     http_response_code(401);

@@ -29,6 +29,47 @@ Corrections après la mise en service sur un vrai hub Ajax.
 - Armement de groupe (CG) : le groupe nommé est « Armé », le hub « Armé
   partiel » seulement si d'autres groupes ne le sont pas.
 
+Relecture complète du 29/09/2026.
+
+- Sécurité :
+  - le point d'entrée du démon n'accepte plus que la clé du plugin, depuis
+    la machine elle-même : la clé API d'un simple utilisateur ou un en-tête
+    X-Real-IP suffisaient à lire les clés AES et à simuler un désarmement ;
+  - texte d'un événement assaini avant d'arriver au dashboard (injection de
+    script par une trame fabriquée) ;
+  - rejeu d'une trame chiffrée avec une autre séquence reconnu comme
+    doublon ; rejeu de vieilles trames sans effet sur l'horloge apprise ;
+    compte chiffré différent de l'en-tête refusé ;
+  - adresses autorisées vérifiées à l'enregistrement (une plage ou un nom
+    étaient ignorés, ce qui laissait tout passer).
+- Fiabilité :
+  - un lot que Jeedom n'a pas pu traiter (redémarrage, base indisponible)
+    est renvoyé au lieu d'être perdu ;
+  - lots traités un à la fois, et commandes publiées après l'enregistrement
+    de l'état : un acquittement pendant une alarme n'est plus écrasé ;
+  - état (mode, alarmes, défauts) gardé en base : une coupure de courant ne
+    le fait plus revenir 30 minutes en arrière ;
+  - horloge des hubs écrite sur disque seulement quand elle change, pour les
+    seuls hubs connus.
+- Logique :
+  - « Mode changé par », « Dernier utilisateur », « Dernière zone »… sont à
+    jour quand un scénario se déclenche sur « Mode » ou « Alarme » ;
+  - une alarme par zone et par type : un détecteur fumée et CO garde son
+    alarme incendie quand le CO retombe ;
+  - le désarmement n'efface plus que l'intrusion : panique, agression,
+    contrainte et médicale attendent l'acquittement ;
+  - bouton panique de l'application (utilisateur 501) : plus de
+    « Zone 501 » ;
+  - nouvelles commandes « Réinitialiser les défauts » et « Appareil
+    injoignable » ; « Appareil ne répond pas » (YX) marque la liaison
+    perdue ; batterie absente et batterie faible suivies séparément ;
+  - zone renumérotée : ses défauts quittent l'ancien numéro ; suppression
+    d'un hub : son état et son message d'alerte sont bien effacés.
+- Interface : sélecteur de type inutilisable retiré, journal et bandeau qui
+  ne s'empilent plus (ni en onglet caché), copie qui signale un échec,
+  bandeau qui ne tourne plus sans fin, accessibilité des boutons,
+  documentation des réglages.
+
 ## 0.2 — 27/09/2026
 
 - Assistant de raccordement : les valeurs à recopier dans Ajax PRO, un bouton

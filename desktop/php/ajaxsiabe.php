@@ -53,7 +53,7 @@ foreach ($eqLogics as $eqLogic) {
 			« connection ») : la clé ne transite donc jamais par le HTML de la page.
 		-->
 		<div class="panel panel-default" id="div_ajaxsiabeConnect" style="margin:5px;">
-			<div class="panel-heading cursor" id="bt_ajaxsiabeConnectToggle">
+			<div class="panel-heading cursor" id="bt_ajaxsiabeConnectToggle" role="button" tabindex="0" aria-controls="div_ajaxsiabeConnectBody">
 				<h3 class="panel-title"><i class="fas fa-plug"></i> {{Raccorder un hub}} <i class="fas fa-chevron-down pull-right"></i></h3>
 			</div>
 			<div class="panel-body" id="div_ajaxsiabeConnectBody" data-open="<?php echo (count($hubs) == 0) ? '1' : '0'; ?>" style="display:none;">
@@ -61,16 +61,16 @@ foreach ($eqLogics as $eqLogic) {
 				<table class="table table-condensed" style="max-width:720px;">
 					<tbody>
 						<tr><td>{{Protocole}}</td><td><b>SIA DC-09 (SIA-DCS)</b></td><td></td></tr>
-						<tr><td>{{Adresse IP}}</td><td><b class="ajaxsiabeConnectValue" data-field="ip"></b></td><td><a class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="ip"><i class="fas fa-copy"></i></a></td></tr>
-						<tr><td>{{Port}}</td><td><b class="ajaxsiabeConnectValue" data-field="port"></b> <small class="text-muted">(TCP)</small></td><td><a class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="port"><i class="fas fa-copy"></i></a></td></tr>
-						<tr><td>{{Numéro d'objet}}</td><td><b class="ajaxsiabeConnectValue" data-field="account"></b> <small class="text-muted">{{(proposé : libre, vous pouvez en choisir un autre de 3 à 16 caractères hexadécimaux)}}</small></td><td><a class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="account"><i class="fas fa-copy"></i></a></td></tr>
+						<tr><td>{{Adresse IP}}</td><td><b class="ajaxsiabeConnectValue" data-field="ip"></b> <small class="text-muted" id="span_ajaxsiabeNoIp" style="display:none;">{{à régler dans Réglages → Système → Configuration → Réseaux}}</small></td><td><a href="#" role="button" class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="ip" title="{{Copier l'adresse IP}}" aria-label="{{Copier l'adresse IP}}"><i class="fas fa-copy" aria-hidden="true"></i></a></td></tr>
+						<tr><td>{{Port}}</td><td><b class="ajaxsiabeConnectValue" data-field="port"></b> <small class="text-muted">(TCP)</small></td><td><a href="#" role="button" class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="port" title="{{Copier le port}}" aria-label="{{Copier le port}}"><i class="fas fa-copy" aria-hidden="true"></i></a></td></tr>
+						<tr><td>{{Numéro d'objet}}</td><td><b class="ajaxsiabeConnectValue" data-field="account"></b> <small class="text-muted">{{(proposé : libre, vous pouvez en choisir un autre de 3 à 16 caractères hexadécimaux)}}</small></td><td><a href="#" role="button" class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="account" title="{{Copier le numéro d'objet}}" aria-label="{{Copier le numéro d'objet}}"><i class="fas fa-copy" aria-hidden="true"></i></a></td></tr>
 						<tr>
 							<td>{{Clé de chiffrement}}</td>
 							<td>
 								<b class="ajaxsiabeConnectValue" data-field="key" style="font-family:monospace;"></b>
-								<a class="btn btn-xs btn-warning" id="bt_ajaxsiabeGenerateKey"><i class="fas fa-key"></i> <span></span></a>
+								<a href="#" role="button" class="btn btn-xs btn-warning" id="bt_ajaxsiabeGenerateKey"><i class="fas fa-key"></i> <span></span></a>
 							</td>
-							<td><a class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="key"><i class="fas fa-copy"></i></a></td>
+							<td><a href="#" role="button" class="btn btn-xs btn-default bt_ajaxsiabeCopy" data-field="key" title="{{Copier la clé}}" aria-label="{{Copier la clé}}"><i class="fas fa-copy" aria-hidden="true"></i></a></td>
 						</tr>
 						<tr><td>{{Intervalle de test (ping)}}</td><td><b>1 {{min}}</b> <small class="text-muted">{{(1 à 5 min : c'est lui qui permet de voir tomber la liaison)}}</small></td><td></td></tr>
 					</tbody>
@@ -82,7 +82,7 @@ foreach ($eqLogics as $eqLogic) {
 		<div class="input-group" style="margin:5px;">
 			<input class="form-control roundedLeft" placeholder="{{Rechercher}}" id="in_searchEqlogic">
 			<div class="input-group-btn">
-				<a id="bt_resetSearch" class="btn" style="width:30px"><i class="fas fa-times"></i></a>
+				<a id="bt_resetSearch" class="btn" style="width:30px" title="{{Effacer la recherche}}" aria-label="{{Effacer la recherche}}"><i class="fas fa-times"></i></a>
 				<a class="btn roundedRight hidden" id="bt_pluginDisplayAsTable" data-coreSupport="1" data-state="0"><i class="fas fa-grip-lines"></i></a>
 			</div>
 		</div>
@@ -191,18 +191,11 @@ foreach ($eqLogics as $eqLogic) {
 								<input type="checkbox" class="eqLogicAttr" data-l1key="isVisible" checked>
 							</div>
 						</div>
-						<!-- Choisi à la création seulement : printEqLogic masque ce bloc pour
-						     un équipement enregistré. Un hub changé en appareil perdrait ses
-						     zones et serait recréé au message suivant. -->
-						<div class="form-group" id="div_ajaxsiabeType">
-							<label class="col-sm-3 control-label">{{Type d'équipement}}</label>
-							<div class="col-sm-3">
-								<select class="eqLogicAttr form-control" id="sel_ajaxsiabeType" data-l1key="configuration" data-l2key="type">
-									<option value="hub">{{Hub (centrale)}}</option>
-									<option value="zone">{{Appareil (zone)}}</option>
-								</select>
-							</div>
-						</div>
+						<!-- Le type n'est pas modifiable : un équipement ajouté à la main est un
+						     hub (preSave), les zones naissent au premier événement de l'appareil
+						     ou par « Nommer la zone » dans le journal. Un hub changé en appareil
+						     perdrait ses zones. Le champ caché sert à afficher le bon bloc. -->
+						<input type="hidden" class="eqLogicAttr" id="in_ajaxsiabeType" data-l1key="configuration" data-l2key="type">
 					</fieldset>
 
 					<!-- ============================ HUB ============================ -->

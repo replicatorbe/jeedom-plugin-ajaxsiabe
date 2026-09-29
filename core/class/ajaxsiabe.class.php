@@ -24,9 +24,12 @@ class ajaxsiabe extends eqLogic {
     const TYPE_HUB  = 'hub';
     const TYPE_ZONE = 'zone';
 
-    /* Numéros d'appareil admis : au-delà, ce n'est pas un appareil Ajax mais
-     * une trame fabriquée, qui ferait naître des équipements à volonté. */
-    const ZONE_MAX = 999;
+    /* Numéros d'appareil admis. Un hub Ajax gère au plus 200 appareils, et ses
+     * utilisateurs de l'application sont numérotés à partir de 501 : un numéro
+     * de 500 ou plus sur un code d'appareil (panique, agression) désigne une
+     * personne, pas une « Zone 501 ». Au-delà, ce serait une trame fabriquée,
+     * qui ferait naître des équipements à volonté. */
+    const ZONE_MAX = 499;
 
     /* Hubs créés automatiquement, au plus : un émetteur qui inventerait des
      * numéros de compte ne doit pas pouvoir remplir Jeedom d'équipements. */
@@ -37,6 +40,16 @@ class ajaxsiabe extends eqLogic {
 
     /* Zones de chaque hub, lues une fois par requête. */
     private static $_zoneCache = array();
+
+    /* Verrou des états (voir lock()) et publications différées (voir
+     * beginPublish()). */
+    private static $_lock = null;
+    private static $_lockDepth = 0;
+    private static $_queue = null;
+
+    /* Publiées avant les autres : un scénario déclenché par « Mode » ou
+     * « Alarme » lit le contexte de cet événement, pas celui du précédent. */
+    private static $_contextCmds = array('last_user', 'last_zone', 'last_category', 'last_code', 'arming_by', 'alarm_type', 'alarm_zone');
 
     /* La clé générale de chiffrement est stockée chiffrée par le coeur. Celle
      * de chaque hub l'est par preSave(), le coeur ne chiffrant pas la
@@ -71,11 +84,13 @@ class ajaxsiabe extends eqLogic {
         array('logicalId' => 'alarm_gas',    'name' => 'Alarme gaz',             'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
         array('logicalId' => 'alarm_panic',  'name' => 'Alarme panique',         'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0, 'isVisible' => 0),
         array('logicalId' => 'reset_alarm',  'name' => 'Acquitter l’alarme',     'type' => 'action', 'subType' => 'other'),
+        array('logicalId' => 'reset_faults', 'name' => 'Réinitialiser les défauts', 'type' => 'action', 'subType' => 'other', 'isVisible' => 0),
         array('logicalId' => 'tamper',       'name' => 'Sabotage',               'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'generic_type' => 'SABOTAGE', 'invert' => 1, 'initial' => 0),
         array('logicalId' => 'power',        'name' => 'Secteur',                'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'initial' => 1),
         array('logicalId' => 'battery_low',  'name' => 'Batterie faible',        'type' => 'info',   'subType' => 'binary', 'invert' => 1, 'initial' => 0),
         array('logicalId' => 'jamming',      'name' => 'Brouillage',             'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0),
         array('logicalId' => 'link',         'name' => 'Liaison',                'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1),
+        array('logicalId' => 'device_lost',  'name' => 'Appareil injoignable',   'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0),
         array('logicalId' => 'last_contact', 'name' => 'Dernier contact',        'type' => 'info',   'subType' => 'string'),
         array('logicalId' => 'last_user',    'name' => 'Dernier utilisateur',    'type' => 'info',   'subType' => 'string', 'isVisible' => 0),
         array('logicalId' => 'last_zone',    'name' => 'Dernière zone',          'type' => 'info',   'subType' => 'string', 'isVisible' => 0),
@@ -245,6 +260,22 @@ class ajaxsiabe extends eqLogic {
         return ($key === '') ? '' : trim((string) utils::decrypt($key));
     }
 
+    /* Une plage ou un nom d'hôte seraient ignorés en silence, et une liste
+     * vide laisse tout passer : on refuse plutôt que de croire filtrer. */
+    public static function preConfig_allowed($_value) {
+        $list = array();
+        foreach (preg_split('/[\s,;]+/', trim((string) $_value)) as $ip) {
+            if ($ip === '') {
+                continue;
+            }
+            if (!filter_var($ip, FILTER_VALIDATE_IP)) {
+                throw new Exception(__('Adresse autorisée invalide (adresse IP exacte attendue, pas de plage ni de nom) :', __FILE__) . ' ' . $ip);
+            }
+            $list[] = $ip;
+        }
+        return implode(', ', array_unique($list));
+    }
+
     /* Liste blanche saisie librement : virgules, espaces ou retours à la ligne. */
     public static function allowedAddresses() {
         $raw = (string) config::byKey('allowed', __CLASS__, '');
@@ -336,12 +367,21 @@ class ajaxsiabe extends eqLogic {
      */
     public static function handleMessages($_messages) {
         /*
-         * Garde-fou : chaque message porte un identifiant unique, et un message
-         * déjà vu est ignoré, sans quoi une alarme déclencherait deux fois les
-         * scénarios. Le démon ne renvoie un lot que si Jeedom n'a pas pu être
-         * joint du tout, mais un mandataire ou une évolution du démon pourrait
-         * le rejouer.
+         * Chaque message porte un identifiant unique, et un message déjà vu est
+         * ignoré, sans quoi une alarme déclencherait deux fois les scénarios :
+         * le démon renvoie tout lot dont il n'a pas eu la confirmation, même si
+         * Jeedom l'a traité (délai dépassé). Un lot à la fois, sous verrou : le
+         * renvoi peut arriver pendant que le premier envoi tourne encore.
          */
+        self::lock();
+        try {
+            self::handleBatch($_messages);
+        } finally {
+            self::unlock();
+        }
+    }
+
+    private static function handleBatch($_messages) {
         $seen = cache::byKey('ajaxsiabe::seen')->getValue(array());
         $seen = is_array($seen) ? $seen : array();
         foreach ($_messages as $message) {
@@ -351,7 +391,10 @@ class ajaxsiabe extends eqLogic {
                 continue;
             }
             if ($uid !== '') {
+                /* Noté avant le traitement, et tout de suite : une erreur fatale
+                 * au milieu du lot ne doit pas faire rejouer ce qui précède. */
                 $seen[$uid] = time();
+                cache::set('ajaxsiabe::seen', $seen);
             }
             try {
                 self::handleMessage($message);
@@ -570,7 +613,11 @@ class ajaxsiabe extends eqLogic {
             $subject['user'] = (int) $addr;
         }
         if ($info['a'] == 'z' && $addr !== '' && ctype_digit($addr)) {
-            $subject['zone'] = (int) $addr;
+            if ((int) $addr > self::ZONE_MAX && $subject['user'] === null) {
+                $subject['user'] = (int) $addr;       // bouton panique de l'application
+            } elseif ((int) $addr <= self::ZONE_MAX) {
+                $subject['zone'] = (int) $addr;
+            }
         }
         if ($subject['user'] !== null) {
             $subject['who'] = $this->userName($subject['user']);
@@ -600,7 +647,10 @@ class ajaxsiabe extends eqLogic {
             $text .= ' (' . $group . ')';
         }
         if (isset($_event['text']) && trim($_event['text']) !== '') {
-            $text .= ' « ' . trim($_event['text']) . ' »';
+            /* Texte venu du réseau, affiché par le dashboard en HTML : sans
+             * balise ni entité, sinon une trame fabriquée y injecterait du
+             * script. */
+            $text .= ' « ' . preg_replace('/[<>&"\'`]/', '?', trim($_event['text'])) . ' »';
         }
         return $text;
     }
@@ -615,27 +665,148 @@ class ajaxsiabe extends eqLogic {
      */
     private function loadState() {
         $state = cache::byKey('ajaxsiabe::state::' . $this->getId())->getValue(null);
+        if (!is_array($state)) {
+            /* Cache perdu (coupure de courant : le coeur ne le sauve que toutes
+             * les 30 minutes) : la copie en base fait foi. */
+            $state = json_decode((string) config::byKey('state::' . $this->getId(), __CLASS__, ''), true);
+        }
         $state = is_array($state) ? $state : array();
-        foreach (array('alarms', 'tamper', 'battery', 'link', 'groups') as $key) {
+        foreach (array('alarms', 'tamper', 'battery', 'battery_missing', 'link', 'groups') as $key) {
             if (!isset($state[$key]) || !is_array($state[$key])) {
                 $state[$key] = array();
+            }
+        }
+        /* 0.3 et avant : une alarme par zone, indexée par son numéro. */
+        foreach ($state['alarms'] as $key => $alarm) {
+            if (!isset($alarm['zone'])) {
+                unset($state['alarms'][$key]);
+                $state['alarms'][(int) $key . '|' . $alarm['type']] = array('zone' => (int) $key) + $alarm;
             }
         }
         return $state;
     }
 
+    /* Cache pour la lecture, base pour survivre à une coupure : un armement
+     * ou une alarme ne doit pas disparaître au redémarrage. La base n'est
+     * écrite que si l'état change (pas à chaque test de liaison). */
     private function saveState($_state) {
         cache::set('ajaxsiabe::state::' . $this->getId(), $_state);
+        $json = json_encode($_state);
+        if ($json !== config::byKey('state::' . $this->getId(), __CLASS__, '')) {
+            config::save('state::' . $this->getId(), $json, __CLASS__);
+        }
     }
 
     /* Publie une valeur seulement si elle change : le coeur traite toujours une
      * valeur vide comme un changement, et relancerait les scénarios. */
     private function updateIfChanged($_logicalId, $_value) {
-        $cmd = $this->getCmd('info', $_logicalId);
-        if (is_object($cmd) && (string) $cmd->execCmd() === (string) $_value) {
+        $current = (self::$_queue !== null) ? $this->queuedValue($_logicalId) : null;
+        if ($current === null) {
+            $cmd = $this->getCmd('info', $_logicalId);
+            $current = is_object($cmd) ? $cmd->execCmd() : null;
+        }
+        if ($current !== null && (string) $current === (string) $_value) {
+            return;
+        }
+        if (self::$_queue !== null) {
+            self::$_queue[] = array('eq' => $this, 'id' => $_logicalId, 'value' => $_value, 'ifChanged' => true);
             return;
         }
         $this->checkAndUpdateCmd($_logicalId, $_value);
+    }
+
+    /* --------------------------------------------- verrou et publication */
+
+    /*
+     * Un seul processus à la fois modifie les états : deux lots (un envoi
+     * du démon expiré puis renvoyé), ou un acquittement pendant un lot, se
+     * liraient et s'écraseraient l'un l'autre. Réentrant : un scénario
+     * synchrone qui acquitte l'alarme pendant son déclenchement tourne dans
+     * le même processus et ne doit pas s'attendre lui-même.
+     */
+    private static function lock() {
+        if (self::$_lockDepth++ > 0) {
+            return;
+        }
+        $handle = @fopen(jeedom::getTmpFolder(__CLASS__) . '/state.lock', 'c');
+        if ($handle === false) {
+            log::add(__CLASS__, 'warning', __('Verrou des états impossible à créer', __FILE__));
+            return;
+        }
+        flock($handle, LOCK_EX);
+        self::$_lock = $handle;
+    }
+
+    private static function unlock() {
+        if (--self::$_lockDepth > 0) {
+            return;
+        }
+        self::$_lockDepth = 0;
+        if (self::$_lock !== null) {
+            flock(self::$_lock, LOCK_UN);
+            fclose(self::$_lock);
+            self::$_lock = null;
+        }
+    }
+
+    /*
+     * Pendant l'application d'un événement, les commandes ne sont mises à
+     * jour qu'une fois l'état enregistré : un scénario synchrone déclenché
+     * par « Alarme » qui acquitte aussitôt doit lire l'état à jour, et son
+     * acquittement ne doit pas être écrasé ensuite. Vrai si l'appelant a
+     * ouvert la file et doit donc la vider.
+     */
+    private static function beginPublish() {
+        if (self::$_queue !== null) {
+            return false;
+        }
+        self::$_queue = array();
+        return true;
+    }
+
+    /* Contexte d'abord, « Dernier événement » en dernier, le reste dans l'ordre. */
+    private static function flushPublish() {
+        $queue = (array) self::$_queue;
+        self::$_queue = null;
+        $ranked = array();
+        foreach ($queue as $index => $item) {
+            $rank = in_array($item['id'], self::$_contextCmds) ? 0 : (($item['id'] === 'last_event') ? 2 : 1);
+            $ranked[] = array($rank, $index, $item);
+        }
+        sort($ranked);
+        foreach ($ranked as $entry) {
+            $item = $entry[2];
+            try {
+                if ($item['ifChanged']) {
+                    $cmd = $item['eq']->getCmd('info', $item['id']);
+                    if (is_object($cmd) && (string) $cmd->execCmd() === (string) $item['value']) {
+                        continue;
+                    }
+                }
+                $item['eq']->checkAndUpdateCmd($item['id'], $item['value']);
+            } catch (Throwable $e) {
+                log::add(__CLASS__, 'error', $item['eq']->getHumanName() . ' ' . $item['id'] . ' : ' . $e->getMessage());
+            }
+        }
+    }
+
+    /* Dernière valeur en file pour cette commande, ou null. */
+    private function queuedValue($_logicalId) {
+        $value = null;
+        foreach ((array) self::$_queue as $item) {
+            if ($item['eq']->getId() == $this->getId() && $item['id'] === $_logicalId) {
+                $value = $item['value'];
+            }
+        }
+        return $value;
+    }
+
+    public function checkAndUpdateCmd($_logicalId, $_value, $_updateTime = null) {
+        if (self::$_queue !== null && !is_object($_logicalId) && $_updateTime === null) {
+            self::$_queue[] = array('eq' => $this, 'id' => $_logicalId, 'value' => $_value, 'ifChanged' => false);
+            return true;
+        }
+        return parent::checkAndUpdateCmd($_logicalId, $_value, $_updateTime);
     }
 
     /* ------------------------------------------------ application */
@@ -643,7 +814,6 @@ class ajaxsiabe extends eqLogic {
     /* Tout message, test de liaison compris, prouve que le hub est vivant. */
     public function touchContact($_time, $_isTest = false) {
         $id = $this->getId();
-        $previous = (int) cache::byKey('ajaxsiabe::contact::' . $id)->getValue(0);
         cache::set('ajaxsiabe::contact::' . $id, $_time);
         if ($_isTest) {
             /* Intervalles observés entre deux tests : ils règlent la supervision
@@ -662,7 +832,7 @@ class ajaxsiabe extends eqLogic {
         }
         $this->checkAndUpdateCmd('last_contact', date('Y-m-d H:i:s', $_time));
         $link = $this->getCmd('info', 'link');
-        if (is_object($link) && $link->execCmd() !== '' && (int) $link->execCmd() === 0 && $previous > 0) {
+        if (is_object($link) && $link->execCmd() !== '' && (int) $link->execCmd() === 0) {
             log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . __('liaison rétablie', __FILE__));
             message::removeAll(__CLASS__, 'linkLost' . $id);
         }
@@ -687,94 +857,138 @@ class ajaxsiabe extends eqLogic {
          * l'utilisateur 5 ne doit pas faire apparaître une « Zone 5 ». */
         $zone = ($zoneNumber > 0) ? $this->zone($zoneNumber, true) : null;
         $label = $this->describeEvent($_event);
-        $state = $this->loadState();
 
         log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . $code . ' : ' . $label);
 
-        if (isset($effects['arm'])) {
-            $this->applyArming($effects['arm'], $_event, $subject, $state);
-        }
+        /* Les commandes ne changent qu'après l'enregistrement de l'état, le
+         * contexte en premier (voir flushPublish()). */
+        $owner = self::beginPublish();
+        self::lock();
+        try {
+            $state = $this->loadState();
 
-        if (isset($effects['alarm'])) {
-            $type = __($effects['alarm'], __FILE__);
-            /* Une alarme déjà mémorisée pour cette zone garde sa mémoire. */
-            $latch = !empty($effects['latch']) || !empty($state['alarms'][$zoneNumber]['latch']);
-            unset($state['alarms'][$zoneNumber]);
-            $state['alarms'][$zoneNumber] = array('type' => $type, 'latch' => $latch ? 1 : 0);
-            $this->checkAndUpdateCmd('alarm_type', $type);
-            $this->checkAndUpdateCmd('alarm_zone', ($zoneNumber > 0) ? $this->zoneName($zoneNumber) : $this->getName());
-            $this->publishAlarms($state);
-            $this->checkAndUpdateCmd('alarm', 1);
-            if (is_object($zone)) {
-                $zone->checkAndUpdateCmd('alarm', 1);
-            }
-        }
+            $categories = AjaxSiaCodec::dictionary('categories');
+            $this->updateIfChanged('last_user', ($subject['user'] !== null) ? $subject['who'] : '');
+            $this->updateIfChanged('last_zone', ($zoneNumber > 0) ? $this->zoneName($zoneNumber) : '');
+            $this->checkAndUpdateCmd('last_category', isset($categories[$info['c']]) ? __($categories[$info['c']], __FILE__) : $info['c']);
+            $this->checkAndUpdateCmd('last_code', $code);
 
-        if (!empty($effects['restore'])) {
-            if (is_object($zone)) {
-                $zone->checkAndUpdateCmd('alarm', 0);
+            if (isset($effects['arm'])) {
+                $this->applyArming($effects['arm'], $_event, $subject, $state);
             }
-            /* Une alarme d'intrusion reste en mémoire : que la porte se referme ne
-             * dit pas que l'intrus est reparti. Les alarmes techniques (eau, feu,
-             * gaz…) retombent avec leur détecteur. */
-            if (isset($state['alarms'][$zoneNumber]) && empty($state['alarms'][$zoneNumber]['latch'])) {
-                unset($state['alarms'][$zoneNumber]);
+
+            if (isset($effects['alarm'])) {
+                /* Une alarme par zone et par type : un détecteur fumée et CO peut
+                 * signaler les deux, et chacune retombe avec son propre
+                 * rétablissement. */
+                $type = __($effects['alarm'], __FILE__);
+                $key = $zoneNumber . '|' . $type;
+                $latch = !empty($effects['latch']) || !empty($state['alarms'][$key]['latch']);
+                unset($state['alarms'][$key]);
+                $state['alarms'][$key] = array('zone' => $zoneNumber, 'type' => $type, 'latch' => $latch ? 1 : 0);
+                $this->checkAndUpdateCmd('alarm_type', $type);
+                $this->checkAndUpdateCmd('alarm_zone', ($zoneNumber > 0) ? $this->zoneName($zoneNumber) : $this->getName());
                 $this->publishAlarms($state);
+                $this->checkAndUpdateCmd('alarm', 1);
+                if (is_object($zone)) {
+                    $zone->checkAndUpdateCmd('alarm', 1);
+                }
             }
-        }
 
-        if (!empty($effects['cancel'])) {
-            $this->clearAlarms($state, $effects['cancel']);
-        }
+            if (!empty($effects['restore'])) {
+                /* Une alarme d'intrusion reste en mémoire : que la porte se
+                 * referme ne dit pas que l'intrus est reparti. Les alarmes
+                 * techniques (eau, feu, gaz…) retombent avec leur détecteur, et
+                 * seulement celle du type rétabli. */
+                $restored = is_string($effects['restore']) ? __($effects['restore'], __FILE__) : null;
+                foreach ($state['alarms'] as $key => $alarm) {
+                    if ($alarm['zone'] == $zoneNumber && empty($alarm['latch'])
+                        && ($restored === null || $alarm['type'] === $restored)) {
+                        unset($state['alarms'][$key]);
+                    }
+                }
+                $this->publishAlarms($state);
+                if (is_object($zone)) {
+                    $zone->updateIfChanged('alarm', $this->zoneHasActiveAlarm($state, $zoneNumber, false) ? 1 : 0);
+                }
+            }
 
-        foreach (array('tamper' => 'tamper', 'battery' => 'battery_low') as $effect => $logicalId) {
-            if (!isset($effects[$effect])) {
-                continue;
+            if (!empty($effects['cancel'])) {
+                $this->clearAlarms($state, $effects['cancel']);
             }
-            if ($effects[$effect]) {
-                $state[$effect][$zoneNumber] = 1;
-            } else {
-                unset($state[$effect][$zoneNumber]);
+
+            /* Batterie faible et batterie absente sont deux états : que l'une
+             * soit rétablie ne dit rien de l'autre. */
+            foreach (array('tamper' => 'tamper', 'battery' => 'battery_low', 'battery_missing' => 'battery_low') as $effect => $logicalId) {
+                if (!isset($effects[$effect])) {
+                    continue;
+                }
+                if ($effects[$effect]) {
+                    $state[$effect][$zoneNumber] = 1;
+                } else {
+                    unset($state[$effect][$zoneNumber]);
+                }
+                $this->publishFaults($state, $zoneNumber, $zone);
             }
+
+            if ($zoneNumber > 0) {
+                /* Un appareil qui parle est un appareil joignable : tout
+                 * événement de la zone rétablit sa liaison, sauf ceux qui
+                 * annoncent une panne ou une perte de liaison. */
+                if (isset($effects['link'])) {
+                    $linkUp = (bool) $effects['link'];
+                } else {
+                    $linkUp = isset($state['link'][$zoneNumber]) && in_array($info['c'], array('panne', 'liaison')) ? false : true;
+                }
+                if ($linkUp) {
+                    unset($state['link'][$zoneNumber]);
+                } else {
+                    $state['link'][$zoneNumber] = 1;
+                }
+                if (is_object($zone)) {
+                    $zone->updateIfChanged('link', $linkUp ? 1 : 0);
+                }
+                $this->updateIfChanged('device_lost', empty($state['link']) ? 0 : 1);
+            }
+            if (isset($effects['power'])) {
+                $this->updateIfChanged('power', $effects['power'] ? 1 : 0);
+            }
+            if (isset($effects['jamming'])) {
+                $this->updateIfChanged('jamming', $effects['jamming'] ? 1 : 0);
+            }
+
+            $this->checkAndUpdateCmd('last_event', $label);
             if (is_object($zone)) {
-                $zone->checkAndUpdateCmd($logicalId, $effects[$effect] ? 1 : 0);
+                $zone->checkAndUpdateCmd('last_event', $label);
             }
-            $this->updateIfChanged($logicalId, empty($state[$effect]) ? 0 : 1);
+            $this->saveState($state);
+        } finally {
+            self::unlock();
+            if ($owner) {
+                self::flushPublish();
+            }
         }
+    }
 
-        if ($zoneNumber > 0) {
-            /* Un appareil qui parle est un appareil joignable : tout événement de
-             * la zone rétablit sa liaison, sauf celui qui annonce sa perte. */
-            $linkUp = !isset($effects['link']) || $effects['link'];
-            if ($linkUp) {
-                unset($state['link'][$zoneNumber]);
-            } else {
-                $state['link'][$zoneNumber] = 1;
-            }
-            if (is_object($zone)) {
-                $zone->updateIfChanged('link', $linkUp ? 1 : 0);
+    /* Le détecteur de la zone est-il encore en alarme ? Une intrusion
+     * mémorisée ne compte pas si $_latched est faux : la porte est refermée. */
+    private function zoneHasActiveAlarm($_state, $_zoneNumber, $_latched = true) {
+        foreach ($_state['alarms'] as $alarm) {
+            if ($alarm['zone'] == $_zoneNumber && ($_latched || empty($alarm['latch']))) {
+                return true;
             }
         }
-        if (isset($effects['power'])) {
-            $this->updateIfChanged('power', $effects['power'] ? 1 : 0);
-        }
-        if (isset($effects['jamming'])) {
-            $this->updateIfChanged('jamming', $effects['jamming'] ? 1 : 0);
-        }
+        return false;
+    }
 
-        $this->saveState($state);
-        /* Le contexte d'abord, l'événement ensuite : un scénario déclenché par
-         * « Dernier événement » doit lire l'utilisateur et la zone de celui-ci,
-         * pas ceux du précédent. */
-        $this->checkAndUpdateCmd('last_user', ($subject['user'] !== null) ? $subject['who'] : '');
-        $this->checkAndUpdateCmd('last_zone', ($zoneNumber > 0) ? $this->zoneName($zoneNumber) : '');
-        $categories = AjaxSiaCodec::dictionary('categories');
-        $this->checkAndUpdateCmd('last_category', isset($categories[$info['c']]) ? __($categories[$info['c']], __FILE__) : $info['c']);
-        $this->checkAndUpdateCmd('last_code', $code);
-        $this->checkAndUpdateCmd('last_event', $label);
-        if (is_object($zone)) {
-            $zone->checkAndUpdateCmd('last_event', $label);
+    /* Sabotage et batterie : la zone, puis la synthèse du hub. */
+    private function publishFaults($_state, $_zoneNumber = null, $_zone = null) {
+        if (is_object($_zone)) {
+            $_zone->updateIfChanged('tamper', isset($_state['tamper'][$_zoneNumber]) ? 1 : 0);
+            $_zone->updateIfChanged('battery_low', (isset($_state['battery'][$_zoneNumber]) || isset($_state['battery_missing'][$_zoneNumber])) ? 1 : 0);
         }
+        $this->updateIfChanged('tamper', empty($_state['tamper']) ? 0 : 1);
+        $this->updateIfChanged('battery_low', (empty($_state['battery']) && empty($_state['battery_missing'])) ? 0 : 1);
     }
 
     /*
@@ -847,11 +1061,13 @@ class ajaxsiabe extends eqLogic {
         }
         $this->checkAndUpdateCmd('arming_by', $who);
 
-        /* Le désarmement complet efface les alarmes mémorisées (intrusion,
-         * panique…). Les alarmes techniques restent tant que leur détecteur
-         * n'est pas revenu au repos : désarmer n'éteint pas un incendie. */
+        /* Le désarmement complet efface la mémoire d'intrusion, et elle
+         * seule. Les alarmes techniques restent tant que leur détecteur n'est
+         * pas revenu au repos (désarmer n'éteint pas un incendie), et panique,
+         * agression, contrainte ou médicale jusqu'à l'acquittement : un
+         * désarmement sous contrainte arrive justement avec son désarmement. */
         if ($global == 'disarmed') {
-            $this->clearAlarms($_state, 'latched');
+            $this->clearAlarms($_state, 'Intrusion');
         }
     }
 
@@ -861,15 +1077,18 @@ class ajaxsiabe extends eqLogic {
      */
     private function clearAlarms(&$_state, $_filter = 'all') {
         $zones = $this->zones();
-        foreach ($_state['alarms'] as $number => $alarm) {
+        $touched = array();
+        foreach ($_state['alarms'] as $key => $alarm) {
             $match = ($_filter == 'all')
                   || ($_filter == 'latched' && !empty($alarm['latch']))
                   || ($alarm['type'] === __($_filter, __FILE__));
-            if (!$match) {
-                continue;
+            if ($match) {
+                unset($_state['alarms'][$key]);
+                $touched[$alarm['zone']] = true;
             }
-            unset($_state['alarms'][$number]);
-            if (isset($zones[$number])) {
+        }
+        foreach (array_keys($touched) as $number) {
+            if (isset($zones[$number]) && !$this->zoneHasActiveAlarm($_state, $number)) {
                 $zones[$number]->updateIfChanged('alarm', 0);
             }
         }
@@ -898,33 +1117,73 @@ class ajaxsiabe extends eqLogic {
             $this->updateIfChanged('alarm_zone', '');
             return;
         }
-        $numbers = array_keys($_state['alarms']);
-        $last = end($numbers);
-        $this->updateIfChanged('alarm_type', $_state['alarms'][$last]['type']);
-        $this->updateIfChanged('alarm_zone', ($last > 0) ? $this->zoneName($last) : $this->getName());
+        $last = end($_state['alarms']);
+        $this->updateIfChanged('alarm_type', $last['type']);
+        $this->updateIfChanged('alarm_zone', ($last['zone'] > 0) ? $this->zoneName($last['zone']) : $this->getName());
+    }
+
+    /* Charge l'état, le modifie, l'enregistre, puis publie : le schéma de
+     * applyEvent(), pour les gestes venus de Jeedom. */
+    private function changeState($_change) {
+        $owner = self::beginPublish();
+        self::lock();
+        try {
+            $state = $this->loadState();
+            $_change($state);
+            $this->saveState($state);
+        } finally {
+            self::unlock();
+            if ($owner) {
+                self::flushPublish();
+            }
+        }
     }
 
     public function resetAlarm() {
-        $state = $this->loadState();
-        $this->clearAlarms($state, 'all');
-        $this->saveState($state);
+        $this->changeState(function (&$_state) {
+            $this->clearAlarms($_state, 'all');
+        });
         log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . __('alarme acquittée depuis Jeedom', __FILE__));
     }
 
-    /* Une zone supprimée n'enverra plus de rétablissement : ses conditions en
-     * cours sont retirées de la synthèse du hub. */
+    /*
+     * Sabotages, batteries, liaisons des appareils, brouillage et secteur
+     * remis au repos. Le hub ne renvoie jamais un rétablissement perdu (Jeedom
+     * arrêté à ce moment-là) : sans ce geste, « Sabotage » resterait à 1.
+     * Un défaut toujours présent reviendra au prochain message du hub.
+     */
+    public function resetFaults() {
+        $this->changeState(function (&$_state) {
+            $_state['tamper'] = $_state['battery'] = $_state['battery_missing'] = $_state['link'] = array();
+            foreach ($this->zones() as $zone) {
+                $zone->updateIfChanged('tamper', 0);
+                $zone->updateIfChanged('battery_low', 0);
+                $zone->updateIfChanged('link', 1);
+            }
+            $this->publishFaults($_state);
+            $this->updateIfChanged('device_lost', 0);
+            $this->updateIfChanged('jamming', 0);
+            $this->updateIfChanged('power', 1);
+        });
+        log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . __('défauts réinitialisés depuis Jeedom', __FILE__));
+    }
+
+    /* Une zone supprimée ou renumérotée n'enverra plus de rétablissement : ses
+     * conditions en cours sont retirées de la synthèse du hub. */
     private function forgetZone($_number) {
-        $state = $this->loadState();
-        foreach (array('tamper' => 'tamper', 'battery' => 'battery_low') as $key => $logicalId) {
-            unset($state[$key][$_number]);
-            $this->updateIfChanged($logicalId, empty($state[$key]) ? 0 : 1);
-        }
-        unset($state['link'][$_number]);
-        if (isset($state['alarms'][$_number])) {
-            unset($state['alarms'][$_number]);
-            $this->publishAlarms($state);
-        }
-        $this->saveState($state);
+        $this->changeState(function (&$_state) use ($_number) {
+            foreach (array('tamper', 'battery', 'battery_missing', 'link') as $key) {
+                unset($_state[$key][$_number]);
+            }
+            $this->publishFaults($_state);
+            $this->updateIfChanged('device_lost', empty($_state['link']) ? 0 : 1);
+            foreach ($_state['alarms'] as $key => $alarm) {
+                if ($alarm['zone'] == $_number) {
+                    unset($_state['alarms'][$key]);
+                }
+            }
+            $this->publishAlarms($_state);
+        });
     }
 
     /* ------------------------------------------------------ supervision */
@@ -1329,6 +1588,16 @@ class ajaxsiabe extends eqLogic {
         } else {
             $hubId = (int) $this->getConfiguration('hub_id');
             $number = (int) $this->getConfiguration('zone');
+            /* Zone renumérotée ou rattachée à un autre hub : l'ancien numéro
+             * n'enverra plus de rétablissement, ses défauts en cours partent. */
+            $stored = ($this->getId() != '') ? self::byId($this->getId()) : null;
+            if (is_object($stored) && $stored->getConfiguration('type') == self::TYPE_ZONE
+                && ((int) $stored->getConfiguration('hub_id') != $hubId || (int) $stored->getConfiguration('zone') != $number)) {
+                $oldHub = self::byId((int) $stored->getConfiguration('hub_id'));
+                if (is_object($oldHub) && $oldHub->getEqType_name() == __CLASS__) {
+                    $oldHub->forgetZone((int) $stored->getConfiguration('zone'));
+                }
+            }
             if ($this->getId() != '' && $hubId > 0 && $number > 0) {
                 foreach (self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_ZONE)) as $other) {
                     if ($other->getId() != $this->getId() && (int) $other->getConfiguration('hub_id') == $hubId
@@ -1374,10 +1643,18 @@ class ajaxsiabe extends eqLogic {
     /* Les appareils n'existent que par leur hub : ils partent avec lui. */
     public function preRemove() {
         if ($this->getConfiguration('type') == self::TYPE_HUB) {
-            self::$_removingHub = (int) $this->getId();
+            $id = (int) $this->getId();
+            self::$_removingHub = $id;
             foreach ($this->zones() as $zone) {
                 $zone->remove();
             }
+            /* Ici et pas dans postRemove() : le coeur a déjà effacé l'id quand
+             * il l'appelle. */
+            foreach (array('state', 'contact', 'lasttest', 'intervals') as $key) {
+                cache::delete('ajaxsiabe::' . $key . '::' . $id);
+            }
+            config::remove('state::' . $id, __CLASS__);
+            message::removeAll(__CLASS__, 'linkLost' . $id);
         }
     }
 
@@ -1390,9 +1667,6 @@ class ajaxsiabe extends eqLogic {
                 $hub->forgetZone((int) $this->getConfiguration('zone'));
             }
             return;
-        }
-        foreach (array('state', 'contact', 'lasttest', 'intervals') as $key) {
-            cache::delete('ajaxsiabe::' . $key . '::' . $this->getId());
         }
         self::reloadDaemonConfig();
     }
@@ -1441,6 +1715,8 @@ class ajaxsiabeCmd extends cmd {
         }
         if ($this->getLogicalId() == 'reset_alarm') {
             $eqLogic->resetAlarm();
+        } elseif ($this->getLogicalId() == 'reset_faults') {
+            $eqLogic->resetFaults();
         }
     }
 }

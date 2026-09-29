@@ -194,18 +194,37 @@ check('UDP : ACK', ackType($reply) === 'ACK');
 
 /* Hub en avance de 33 s : refusé tant que son horloge n'est pas connue,
  * accepté ensuite. Une réémission ne compte que pour une mesure. */
-$ahead = time() + 33;
 $replies = array();
-foreach (array(30, 30, 30, 31, 32) as $seq) {
+$first = AjaxSiaCodec::build('SIA-DCS', 30, '5A5A', 'Nri1/CL30', $key, time() + 33);
+for ($i = 0; $i < 3; $i++) {
+    $replies[] = ackType(exchange($first));     // réémissions : une seule mesure
+}
+foreach (array(31, 32) as $seq) {
+    usleep(1100000);                            // une mesure par message plus récent
     $replies[] = ackType(exchange(AjaxSiaCodec::build('SIA-DCS', $seq, '5A5A', 'Nri1/CL' . $seq, $key, time() + 33)));
 }
 check('hub en avance : NAK tant que trois mesures distinctes manquent', $replies === array('NAK', 'NAK', 'NAK', 'NAK', 'NAK'));
+usleep(1100000);
 check('hub en avance : accepté une fois son horloge apprise',
       ackType(exchange(AjaxSiaCodec::build('SIA-DCS', 33, '5A5A', 'Nri1/OP33', $key, time() + 33))) === '*ACK');
 check('hub en avance : un message vieux de 60 s reste refusé',
       ackType(exchange(AjaxSiaCodec::build('SIA-DCS', 34, '5A5A', 'Nri1/OP34', $key, time() - 60))) === 'NAK');
 check('hub en avance : une mesure isolée ne défait pas la correction',
       ackType(exchange(AjaxSiaCodec::build('SIA-DCS', 35, '5A5A', 'Nri1/OP35', $key, time() + 33))) === '*ACK');
+
+/* Rejeu : une vieille trame authentique, séquence changée, trois fois. Elle
+ * ne doit ni fausser l'horloge (sinon toutes les alarmes seraient refusées),
+ * ni être traitée deux fois quand elle tombe dans la fenêtre. */
+foreach (array(40, 41, 42) as $seq) {
+    exchange(AjaxSiaCodec::build('SIA-DCS', $seq, '5A5A', 'Nri1/OP40', $key, time() - 86400));
+}
+check('rejeu de vieilles trames : l\'horloge du hub reste apprise',
+      ackType(exchange(AjaxSiaCodec::build('SIA-DCS', 43, '5A5A', 'Nri1/BA43', $key, time() + 33))) === '*ACK');
+$fresh = time() + 33;
+exchange(AjaxSiaCodec::build('SIA-DCS', 44, '5A5A', 'Nri1/CL44', $key, $fresh));
+exchange(AjaxSiaCodec::build('SIA-DCS', 45, '5A5A', 'Nri1/CL44', $key, $fresh));
+$replayed = array_filter(journalEntries(), function ($_e) { return isset($_e['seq']) && $_e['seq'] === '0045'; });
+check('rejeu dans la fenêtre, séquence changée : doublon', count($replayed) === 1 && reset($replayed)['status'] === 'duplicate');
 $status = order('status');
 check('état : horloge du hub +33 s', isset($status['result']['clock']['5A5A']) && abs($status['result']['clock']['5A5A'] - 33) <= 1);
 check('horloge gardée sur disque', strpos((string) @file_get_contents($dir . '/p/data/clock.json'), '5A5A') !== false);

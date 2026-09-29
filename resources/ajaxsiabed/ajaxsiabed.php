@@ -77,11 +77,13 @@ SiaLog::setLevel(isset($opt['loglevel']) ? $opt['loglevel'] : 'error');
 class AjaxSiaDaemon {
 
     /* Remise à Jeedom. Délai large : le premier message d'un hub crée des
-     * équipements, ce qui prend du temps sur un petit matériel. Une seule
-     * nouvelle tentative, et seulement si Jeedom n'a pas été joint du tout :
-     * relancer un envoi qui a expiré le ferait traiter deux fois. */
+     * équipements, ce qui prend du temps sur un petit matériel. Un lot non
+     * remis (Jeedom redémarre, base indisponible) est renvoyé, à intervalle
+     * croissant : le hub a déjà eu son accusé, il ne le renverra pas. Un lot
+     * reçu deux fois ne coûte rien, Jeedom écarte les identifiants déjà vus. */
     const PUSH_TIMEOUT   = 20;
     const PUSH_QUEUE_MAX = 500;
+    const PUSH_RETRY_MAX = 60;       // délai maximal entre deux renvois, en s
 
     /* La configuration est lue dans la boucle : un délai court, pour ne pas
      * laisser un hub sans accusé pendant qu'on attend Jeedom. */
@@ -142,8 +144,14 @@ class AjaxSiaDaemon {
     private $orders = array();       // (int) ressource => connexion d'ordres
     private $pushQueue = array();
     private $pushPid = 0;
+    private $pushBatch = array();    // lot en cours d'envoi, remis en file s'il échoue
+    private $pushRetryAt = 0;
+    private $pushDelay = 0;
     private $dedup = array();
-    private $clock = null;           // compte => [séquence => écart], chargé à la demande
+    private $clock = null;           // compte => [t, s, o], chargé à la demande
+    private $clockSaved = '';
+    private $clockSavedAt = 0;
+    private $clockWriteFailed = false;
     private $noise = array();        // émetteur|motif => [début, nombre]
     private $reloadPending = false;
     private $running = true;
@@ -391,6 +399,9 @@ class AjaxSiaDaemon {
 
         SiaLog::info('arrêt du démon');
         $this->flushNoise(true);
+        if ($this->clock !== null) {
+            $this->saveClock(true);
+        }
         $this->closeListeners();
         foreach ($this->orders as $order) {
             @fclose($order['stream']);
@@ -646,7 +657,7 @@ class AjaxSiaDaemon {
         }
         /* Mesure sur les seuls messages authentiques : déchiffrés avec la clé
          * (même hors fenêtre, sinon un hub décalé ne serait jamais appris), ou
-         * en clair pour un compte sans clé. */
+         * en clair pour un hub connu sans clé. */
         if ($msg['status'] === 'ok' && ($msg['encrypted'] || $status === 'ok')) {
             $this->clockSample($msg);
         }
@@ -675,6 +686,14 @@ class AjaxSiaDaemon {
             $this->stats['rejected']++;
             $this->journalNoise($_peer, $_proto, $status, $error, $msg['raw']);
             return array('reply' => null, 'valid' => false);
+        }
+        if (in_array($status, array('decrypt', 'plain'))) {
+            /* Trame intègre mais refusée (clé fausse, clair pour un hub
+             * chiffré) : rien ne limite leur nombre, surtout en UDP. La
+             * première est consignée en entier, les suivantes résumées. */
+            $this->stats['rejected']++;
+            $this->journalNoise($_peer, $_proto, $status, $error . ' — ' . $what, $msg['raw']);
+            return array('reply' => $reply, 'valid' => $valid);
         }
 
         $entry = array(
@@ -738,21 +757,44 @@ class AjaxSiaDaemon {
         if ($_msg['type'] === 'NULL') {
             return false;
         }
-        $key = $_msg['account'] . '|' . $_msg['seq'] . '|' . $_msg['type'] . '|' . $_msg['data'];
-        if (isset($this->dedup[$key])) {
-            return true;
+        $keys = array($_msg['account'] . '|' . $_msg['seq'] . '|' . $_msg['type'] . '|' . $_msg['data']);
+        /* La séquence est en clair : un rejeu d'une trame chiffrée peut la
+         * changer, pas l'horodatage chiffré. Cette seconde clé reconnaît le
+         * rejeu d'un armement dans la fenêtre, qui serait sinon traité deux
+         * fois. La durée de vie couvre la fenêtre (40 s) plus le décalage
+         * d'horloge admis (120 s). */
+        if ($_msg['encrypted'] && $_msg['timestamp'] !== null) {
+            $keys[] = 'ts|' . $_msg['account'] . '|' . $_msg['type'] . '|' . $_msg['data'] . '|' . $_msg['timestamp'];
         }
-        $this->dedup[$key] = $_now;
-        return false;
+        $duplicate = false;
+        foreach ($keys as $key) {
+            if (isset($this->dedup[$key])) {
+                $duplicate = true;
+            }
+            $this->dedup[$key] = $_now;
+        }
+        return $duplicate;
     }
 
     /* --------------------------------------------------------------- horloge */
 
+    /*
+     * Par compte : « t » horodatage (heure du hub) de la dernière mesure,
+     * « s » les derniers écarts mesurés, « o » le dernier décalage retenu.
+     *
+     * Une mesure n'est prise que sur un message plus récent que la précédente.
+     * La séquence est en clair, protégée par le seul CRC : un rejeu peut la
+     * changer, pas l'horodatage chiffré. Sans cette règle, trois rejeus d'une
+     * vieille trame suffiraient à fausser l'horloge et à faire refuser toutes
+     * les alarmes du vrai hub. Pour la même raison, des mesures qui cessent de
+     * concorder laissent le dernier décalage en place au lieu de le remettre à
+     * zéro, et seuls les hubs connus sont mesurés.
+     */
     private function clockOffsets() {
         $this->loadClock();
         $offsets = array();
         foreach (array_keys($this->clock) as $account) {
-            $offsets[$account] = $this->clockOffset((string) $account);
+            $offsets[(string) $account] = $this->clockOffset((string) $account);
         }
         return $offsets;
     }
@@ -762,52 +804,91 @@ class AjaxSiaDaemon {
     }
 
     private function loadClock() {
-        if ($this->clock === null) {
-            $clock = json_decode((string) @file_get_contents($this->clockFile()), true);
-            $this->clock = is_array($clock) ? $clock : array();
+        if ($this->clock !== null) {
+            return;
         }
+        $this->clock = array();
+        $clock = json_decode((string) @file_get_contents($this->clockFile()), true);
+        foreach (is_array($clock) ? $clock : array() as $account => $entry) {
+            if (!is_array($entry)) {
+                continue;
+            }
+            /* Format de la 0.3 (séquence => écart) : les écarts sont repris. */
+            $samples = isset($entry['s']) ? $entry['s'] : (isset($entry['o']) ? array() : $entry);
+            $samples = is_array($samples) ? array_values(array_filter($samples, 'is_int')) : array();
+            $this->clock[(string) $account] = array(
+                't' => (isset($entry['t']) && is_int($entry['t'])) ? $entry['t'] : 0,
+                's' => array_slice($samples, -self::CLOCK_SAMPLES),
+                'o' => (isset($entry['o']) && is_int($entry['o']) && abs($entry['o']) <= self::CLOCK_MAX) ? $entry['o'] : 0,
+            );
+            $this->clock[(string) $account]['o'] = $this->clockOffset((string) $account);
+        }
+        $this->clockSaved = json_encode($this->clock);
     }
 
     /* Décalage à retrancher à l'écart d'un message de ce compte, en s. */
     public function clockOffset($_account) {
         $this->loadClock();
-        $samples = isset($this->clock[$_account]) && is_array($this->clock[$_account]) ? array_values($this->clock[$_account]) : array();
-        if (count($samples) < self::CLOCK_MIN) {
+        if (!isset($this->clock[$_account])) {
             return 0;
         }
-        sort($samples);
-        $median = (int) $samples[(int) floor(count($samples) / 2)];
-        /* Une mesure isolée (message mis en file pendant une coupure) ne doit
-         * pas annuler la correction : il suffit que la plupart concordent. */
-        $close = array_filter($samples, function ($_s) use ($median) { return abs($_s - $median) <= self::CLOCK_SPREAD; });
-        return (count($close) >= self::CLOCK_MIN && abs($median) <= self::CLOCK_MAX) ? $median : 0;
+        $entry = $this->clock[$_account];
+        $samples = $entry['s'];
+        if (count($samples) >= self::CLOCK_MIN) {
+            sort($samples);
+            $median = (int) $samples[(int) floor(count($samples) / 2)];
+            /* Une mesure isolée (message mis en file pendant une coupure) ne
+             * doit pas annuler la correction : il suffit que la plupart
+             * concordent. */
+            $close = array_filter($samples, function ($_s) use ($median) { return abs($_s - $median) <= self::CLOCK_SPREAD; });
+            if (count($close) >= self::CLOCK_MIN && abs($median) <= self::CLOCK_MAX) {
+                return $median;
+            }
+        }
+        return $entry['o'];
     }
 
-    /*
-     * Une mesure par numéro de séquence : un hub qui réémet un message refusé,
-     * ou une trame rejouée en boucle, ne compte qu'une fois. Les tests de
-     * liaison, tous en séquence 0000, partagent une seule place.
-     */
     private function clockSample($_msg) {
-        if ($_msg['skew'] === null || $_msg['account'] === '') {
+        if ($_msg['skew'] === null || $_msg['timestamp'] === null || !isset($this->config['hubs'][$_msg['account']])
+            || abs($_msg['skew']) > self::CLOCK_MAX + AjaxSiaCodec::WINDOW_PAST) {
             return;
         }
         $this->loadClock();
         $account = $_msg['account'];
-        $samples = isset($this->clock[$account]) && is_array($this->clock[$account]) ? $this->clock[$account] : array();
-        $seq = 's' . $_msg['seq'];
-        $before = $this->clockOffset($account);
-        unset($samples[$seq]);
-        $samples[$seq] = (int) $_msg['skew'];
-        $this->clock[$account] = array_slice($samples, -self::CLOCK_SAMPLES, null, true);
-        $after = $this->clockOffset($account);
-        if ($after !== $before) {
-            SiaLog::info('horloge du compte ' . $account . ' : ' . sprintf('%+d', $after) . ' s');
+        $entry = isset($this->clock[$account]) ? $this->clock[$account] : array('t' => 0, 's' => array(), 'o' => 0);
+        if ($_msg['timestamp'] <= $entry['t']) {
+            return;
         }
+        $entry['t'] = (int) $_msg['timestamp'];
+        $entry['s'][] = (int) $_msg['skew'];
+        $entry['s'] = array_slice($entry['s'], -self::CLOCK_SAMPLES);
+        $before = $entry['o'];
+        $this->clock[$account] = $entry;
+        $this->clock[$account]['o'] = $this->clockOffset($account);
+        if ($this->clock[$account]['o'] !== $before) {
+            SiaLog::info('horloge du compte ' . $account . ' : ' . sprintf('%+d', $this->clock[$account]['o']) . ' s');
+        }
+        $this->saveClock($this->clock[$account]['o'] !== $before);
+    }
+
+    /* Sur disque quand le décalage change, sinon au plus toutes les dix
+     * minutes : un test de liaison par minute ne doit pas user la carte SD. */
+    private function saveClock($_force = false) {
         $data = json_encode($this->clock);
-        if (@file_put_contents($this->clockFile() . '.tmp', $data) === false || !@rename($this->clockFile() . '.tmp', $this->clockFile())) {
-            SiaLog::error('écriture impossible : ' . $this->clockFile());
+        if ($data === $this->clockSaved || (!$_force && time() - $this->clockSavedAt < 600)) {
+            return;
         }
+        $file = $this->clockFile();
+        if (@file_put_contents($file . '.tmp', $data) === false || !@rename($file . '.tmp', $file)) {
+            if (!$this->clockWriteFailed) {
+                SiaLog::error('écriture impossible : ' . $file . ' (le décalage des horloges sera réappris au redémarrage)');
+                $this->clockWriteFailed = true;
+            }
+            return;
+        }
+        $this->clockWriteFailed = false;
+        $this->clockSaved = $data;
+        $this->clockSavedAt = time();
     }
 
     /* -------------------------------------------------------------- journal */
@@ -909,14 +990,12 @@ class AjaxSiaDaemon {
      */
     private function drainPushQueue() {
         if ($this->pushPid > 0) {
-            /* 0 : le fils tourne encore. Toute autre valeur, -1 compris (fils
-             * déjà récolté par reapChildren), veut dire qu'il est terminé. */
             if (pcntl_waitpid($this->pushPid, $status, WNOHANG) === 0) {
-                return;
+                return;                      // le fils tourne encore
             }
-            $this->pushPid = 0;
+            $this->pushFinished($status);
         }
-        if (empty($this->pushQueue)) {
+        if (empty($this->pushQueue) || time() < $this->pushRetryAt) {
             return;
         }
         $batch = $this->pushQueue;
@@ -924,16 +1003,20 @@ class AjaxSiaDaemon {
 
         $pid = pcntl_fork();
         if ($pid == -1) {
-            SiaLog::error('fork impossible pour l\'envoi, lot abandonné (il reste au journal)');
+            SiaLog::error('fork impossible pour l\'envoi, nouvel essai plus tard');
+            $this->pushQueue = $batch;
+            $this->pushRetryAt = time() + 5;
             return;
         }
         if ($pid > 0) {
             $this->pushPid = $pid;
+            $this->pushBatch = $batch;
             return;
         }
         $this->closeInheritedSockets();
         if ($this->callback('', array('events' => $batch)) === false) {
-            SiaLog::error(count($batch) . ' événement(s) non remis à Jeedom (ils restent au journal)');
+            SiaLog::error(count($batch) . ' événement(s) non remis à Jeedom');
+            exit(1);
         }
         exit(0);
     }
@@ -954,9 +1037,31 @@ class AjaxSiaDaemon {
         }
     }
 
+    /* Fin du fils d'envoi : succès, ou le lot repasse en tête, dans l'ordre. */
+    private function pushFinished($_status) {
+        $this->pushPid = 0;
+        if (pcntl_wifexited($_status) && pcntl_wexitstatus($_status) === 0) {
+            $this->pushBatch = array();
+            $this->pushDelay = 0;
+            return;
+        }
+        $this->pushQueue = array_merge($this->pushBatch, $this->pushQueue);
+        $this->pushBatch = array();
+        while (count($this->pushQueue) > self::PUSH_QUEUE_MAX) {
+            array_shift($this->pushQueue);
+        }
+        $this->pushDelay = min(self::PUSH_RETRY_MAX, max(5, $this->pushDelay * 2));
+        $this->pushRetryAt = time() + $this->pushDelay;
+        SiaLog::warning(count($this->pushQueue) . ' événement(s) en attente de Jeedom, nouvel essai dans ' . $this->pushDelay . ' s');
+    }
+
+    /* Le fils d'envoi peut être récolté ici : son code de sortie décide alors
+     * du renvoi, comme dans drainPushQueue. */
     private function reapChildren() {
-        while (pcntl_waitpid(-1, $status, WNOHANG) > 0) {
-            // vide la table des processus
+        while (($pid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
+            if ($pid === $this->pushPid) {
+                $this->pushFinished($status);
+            }
         }
     }
 
