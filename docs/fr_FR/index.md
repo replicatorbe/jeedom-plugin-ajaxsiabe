@@ -24,7 +24,9 @@ PHP qui écoute sur le réseau local.
 Le SIA est un protocole d'alarme, et il ne va que dans un sens. Il transmet
 des événements, pas des états continus. On n'y trouve ni l'ouverture d'une
 porte quand le système est désarmé, ni les températures. Il ne permet pas non
-plus d'armer ou de désarmer le système depuis Jeedom.
+plus d'armer ou de désarmer le système depuis Jeedom : pour cela, le hub
+s'appuie sur le plugin officiel Ajax (cloud), voir
+[Piloter l'alarme avec le plugin Ajax (cloud)](#piloter-lalarme-avec-le-plugin-ajax-cloud).
 
 Le hub envoie ses messages sur le réseau local. S'il perd sa connexion
 Ethernet ou Wi-Fi et bascule sur le réseau mobile, il ne peut plus joindre
@@ -119,6 +121,13 @@ le créer à la main (bouton **Ajouter**) avant de configurer Ajax : un
 | Catégorie du dernier événement | Alarme, Armement, Sabotage, Panne, Alimentation, Batterie, Liaison, Test, Accès, Système ou Information. Masquée par défaut. |
 | Dernier événement | L'événement en toutes lettres, par exemple « Armement par Jérôme ». |
 | Dernier code SIA | Le code brut, par exemple `CL`. |
+| Armer, Mode nuit, Désarmer | Actions : l'ordre part par le plugin Ajax (cloud) et c'est le SIA qui le confirme. Refusées tant que l'onglet « Pilotage cloud » n'est pas réglé. Types génériques ALARM_ARMED, ALARM_SET_MODE et ALARM_RELEASED. |
+| Panique | Action, masquée par défaut, confirmée par l'alarme panique du SIA. |
+| Dernier ordre | « Armer — confirmé par le SIA à 22:03:14 (4 s) », « … — en attente de confirmation par le SIA », « … — NON confirmé par le SIA (2 essais, 60 s chacun) », « … — déjà dans cet état selon le SIA … : ordre non envoyé », « … — refusé : … ». |
+| Ordre en cours | 1 entre l'envoi d'un ordre et sa confirmation (ou son échec). |
+| Échec du dernier ordre | 1 quand le dernier ordre n'a pas été confirmé par le SIA ; historisée. Repasse à 0 au prochain ordre, ou si la confirmation arrive quand même. |
+| État cloud | L'état du hub selon le cloud, traduit : Désarmé, Armé, Mode nuit, Armé partiel, ou « Inconnu (valeur) ». |
+| Cohérence cloud | 1 tant que le SIA et le cloud sont d'accord (ou que l'écart reste dans la tolérance), 0 au-delà. |
 
 **Fin d'une alarme.**
 
@@ -166,12 +175,187 @@ Elle est créée sous le nom « Zone N ». **Renommez-la d'après l'appareil** :
 son nom sert ensuite dans les événements et dans « Origine de l’alarme ».
 
 Commandes : Alarme, Sabotage, Batterie faible, Liaison, Dernier événement.
+
+Une zone peut être liée à son appareil du plugin Ajax (cloud) : voir
+[Zones liées aux appareils du cloud](#zones-liées-aux-appareils-du-cloud).
 Tout événement venu de l'appareil remet sa liaison à 1, sauf celui qui en
 annonce la perte.
 
 Supprimer une zone retire ses sabotages et batteries faibles en cours de la
 synthèse du hub. Supprimer un hub supprime ses zones ; il sera recréé à son
 prochain message si la création automatique est active.
+
+## Piloter l'alarme avec le plugin Ajax (cloud)
+
+L'objectif : **une seule alarme dans Jeedom**, le hub de ce plugin. Les
+scénarios, JeedomConnect, Google Home ou un plugin de présence l'arment et le
+désarment par ses commandes « Armer », « Mode nuit » et « Désarmer », et
+lisent son « Mode ».
+
+### Pourquoi deux plugins
+
+- Le **SIA** est rapide (le hub envoie sa trame dans la seconde), local et
+  signé de sa clé, mais **unidirectionnel** : Jeedom écoute, il ne peut rien
+  commander.
+- Le plugin officiel **Ajax** (`ajaxSystem`) passe par le cloud Jeedom puis
+  le cloud Ajax. Il sait **armer et désarmer**, mais ses retours d'état
+  arrivent en une seconde, en plusieurs minutes, ou pas du tout.
+
+Le hub SIA donne donc ses ordres par le plugin Ajax, et c'est le SIA qui dit
+s'ils ont pris effet. Le SIA reste la source de vérité de l'état : le
+« Mode » et « Armée » du hub ne suivent jamais le cloud.
+
+### Le cycle d'un ordre
+
+1. « Armer » est exécuté (scénario, tableau de bord, assistant vocal…).
+2. **Si le SIA indique déjà le mode demandé**, rien n'est envoyé :
+   « Dernier ordre » dit « déjà dans cet état selon le SIA ». Le hub
+   n'émettrait d'ailleurs aucune trame pour un mode qui ne change pas.
+3. Sinon, la commande du plugin Ajax réglée pour cet ordre est lancée **en
+   tâche de fond**, l'ordre attendu est mémorisé (il survit à un redémarrage
+   de Jeedom), « Ordre en cours » passe à 1. L'action rend la main
+   aussitôt : ni l'appelant ni le cron n'attendent le cloud.
+4. Quand la trame SIA du mode demandé arrive (`CL` armement, `NL` mode nuit,
+   `OP` désarmement, `PA` pour la panique), l'ordre est **confirmé** :
+   « Armer — confirmé par le SIA à 22:03:14 (4 s) ».
+5. Sans confirmation dans le **délai** (60 s par défaut, vérifié chaque
+   minute), l'ordre est **renvoyé** (un nouvel essai par défaut).
+6. Toujours rien : l'ordre est déclaré **en échec**. « Échec du dernier
+   ordre » passe à 1, un message apparaît dans le centre de messages et les
+   **actions d'échec** sont jouées une fois. Si la trame arrive quand même
+   dans le quart d'heure, « Dernier ordre » le dit et l'échec est levé.
+
+Un nouvel ordre **remplace** l'ordre en cours (le journal le mentionne). Un
+autre mode reçu pendant l'attente (quelqu'un désarme au clavier) ne termine
+pas l'ordre : on attend le mode demandé jusqu'à l'échéance.
+
+**Garde-fous.** Sans commande réglée, ou si elle a été supprimée, l'action
+est **refusée** : l'appelant reçoit une erreur et « Dernier ordre » dit
+pourquoi. Une commande du plugin Ajax SIA lui-même est refusée (l'ordre
+tournerait en rond). Aucun événement reçu, ni du SIA ni du cloud, ne donne
+jamais d'ordre, et en particulier jamais de désarmement : seule une action
+explicite le fait, et seul le cron renvoie un ordre non confirmé.
+
+Chaque ordre, confirmation, nouvel essai ou échec est écrit dans le log
+`ajaxsiabe` et dans le **Journal SIA**, entre les trames, avec le statut
+« Jeedom ».
+
+À savoir : si la case « Vérifier l'état avant exécution » du coeur est
+active, le plugin Ajax ignore un ordre quand **son** état indique déjà le mode
+demandé. Si le cloud se trompe, l'ordre n'est pas envoyé, le SIA ne confirme
+rien et l'échec est signalé : c'est voulu, l'alarme n'est pas dans l'état
+demandé.
+
+### Réglages (onglet « Pilotage cloud » du hub)
+
+| Réglage | Clé de configuration | Défaut |
+|---|---|---|
+| Commande du cloud pour Armer, Mode nuit, Désarmer, Panique | `order_arm_cmd`, `order_night_cmd`, `order_disarm_cmd`, `order_panic_cmd` (`#id#`) | vide : ordre refusé |
+| Délai de confirmation (s) | `order_arm_delay`… | 60 (10 à 3600) |
+| Nouvel(s) essai(s) | `order_arm_retries`… | 1 (0 à 5) |
+| Actions en cas d'échec d'un ordre | `order_actions` | aucune |
+| Commande d'état du cloud | `cloud_state_cmd` (`#id#`) | vide : pas de surveillance |
+| Tolérance (min) | `cloud_tolerance` | 2 |
+| Correspondance des valeurs | `cloud_state_map` | table d'ajaxSystem |
+| Actions en cas de divergence | `cloud_actions` | aucune |
+
+Les actions se choisissent comme dans un scénario (commande ou bloc
+message, scénario, variable), avec titre et message. Balises des actions
+d'échec : `#ordre#` (Armer…), `#mode#` (mode visé), `#hub#`, `#essais#`,
+`#message#` (la phrase complète). Balises des actions de divergence :
+`#hub#`, `#mode#` (mode SIA), `#etat_cloud#`, `#coherent#` (0 à l'alerte, 1
+au retour), `#message#`.
+
+### Surveillance croisée SIA et cloud
+
+Avec une commande d'état du cloud réglée, le hub compare chaque minute (et
+dès que l'état du cloud change) le mode du SIA à celui du cloud :
+
+- « État cloud » montre l'état du cloud traduit ; « Cohérence cloud » vaut 1
+  tant qu'ils sont d'accord ;
+- un écart qui dure **au-delà de la tolérance** (2 min par défaut : le cloud
+  suit souvent avec retard) fait passer « Cohérence cloud » à 0, écrit un
+  message et joue les actions de divergence, **une fois par épisode** ;
+- le **retour à la normale** est signalé à son tour (message retiré, actions
+  rejouées avec `#coherent#` à 1) ;
+- si le SIA **se tait** (liaison perdue, récepteur arrêté) alors que le cloud
+  répond avec un autre état, l'alerte le dit comme tel. Le message de perte
+  de liaison du hub indique aussi depuis quand le cloud Ajax a donné signe de
+  vie : un hub muet en SIA mais vivant dans le cloud, c'est un problème de
+  réseau local, pas une centrale éteinte ;
+- pendant un ordre en cours, rien n'est comparé : l'ordre a sa propre
+  alerte.
+
+Le mode du hub ne bascule **jamais** sur la foi du cloud.
+
+**Correspondance des valeurs.** Une ligne par valeur : `valeur=mode`, le mode
+s'écrivant `Désarmé`, `Armé`, `Mode nuit`, `Armé partiel` (ou `disarmed`,
+`armed`, `night`, `partial`). Vide, c'est la table du plugin Ajax, relevée
+dans son code :
+
+| Valeur de « Etat » (ajaxSystem) | Mode |
+|---|---|
+| `DISARMED`, `DISARMED_NIGHT_MODE_OFF`, `0` | Désarmé |
+| `ARMED`, `ARMED_NIGHT_MODE_OFF`, `ARMED_NIGHT_MODE_ON`, `1` | Armé |
+| `NIGHT_MODE`, `DISARMED_NIGHT_MODE_ON`, `2` | Mode nuit |
+| `PARTIALLY_ARMED` | Armé partiel |
+
+Le plugin Ajax convertit l'état poussé par le cloud (0, 1, 2) en `DISARMED`,
+`ARMED`, `NIGHT_MODE` ; les autres valeurs viennent de l'API Ajax lors d'une
+synchronisation. `PANIC` n'est pas un mode : une valeur absente de la table
+s'affiche « Inconnu (valeur) » et n'est jamais comparée.
+
+### Zones liées aux appareils du cloud
+
+Sur une zone, **Appareil Ajax (cloud)** la lie à un appareil du plugin Ajax
+(clé `cloud_eqLogic`, l'identifiant de l'équipement ajaxSystem). Tant que
+**Nom Ajax dans les événements** est coché (clé `cloud_name`, 1 par défaut),
+le nom de l'appareil, tel que le cloud le connaît et renommages compris, sert
+dans « Origine de l’alarme », « Dernière zone » et les événements. Le bouton
+**Reprendre nom et pièce** recopie son nom et son objet parent dans la zone
+(à sauvegarder ensuite).
+
+Il n'y a **pas de correspondance automatique fiable** : le plugin Ajax
+n'enregistre pas le numéro de zone SIA de ses appareils (le cloud le
+transmet dans ses événements, sous le nom `cmsDeviceIndex`, mais le plugin ne
+le garde pas). Seul son champ **Numéro de l'équipement**, rempli à la main,
+peut servir : quand il est égal au numéro de la zone, la page propose l'appareil
+(« Suggestion … Lier »). Le lien reste une décision manuelle.
+
+### Exemple : l'installation de référence
+
+Hub SIA « Hub Ajax 2701 » (compte 2701), plugin Ajax avec son hub « Ajax
+hub » : commande d'état « Etat » (#6793#), actions « Armement » (#6802#),
+« Mode nuit » (#6803#), « Desarmement » (#6804#), « Panic » (#6805#).
+
+| Réglage | Valeur |
+|---|---|
+| Armer | `#6802#`, 60 s, 1 essai |
+| Mode nuit | `#6803#`, 60 s, 1 essai |
+| Désarmer | `#6804#`, 60 s, 1 essai |
+| Panique | vide (ou `#6805#`) |
+| Commande d'état du cloud | `#6793#` |
+| Tolérance | 2 min |
+| Correspondance | vide (table par défaut) |
+
+Le même réglage par l'API JSON-RPC de Jeedom (méthode `eqLogic::save`,
+équipement 528) :
+
+```json
+{"id": 528, "eqType_name": "ajaxsiabe", "configuration": {
+  "order_arm_cmd": "#6802#", "order_night_cmd": "#6803#", "order_disarm_cmd": "#6804#",
+  "order_arm_delay": 60, "order_night_delay": 60, "order_disarm_delay": 60,
+  "order_arm_retries": 1, "order_night_retries": 1, "order_disarm_retries": 1,
+  "cloud_state_cmd": "#6793#", "cloud_tolerance": 2,
+  "order_actions": [{"cmd": "#123#", "options": {"enable": "1", "title": "Alarme #hub#", "message": "#message#"}}],
+  "cloud_actions": [{"cmd": "#123#", "options": {"enable": "1", "title": "Alarme #hub#", "message": "#message#"}}]
+}}
+```
+
+(`#123#` : une commande de notification de votre choix.) Et pour une zone,
+par exemple la zone liée à la « Baie vitrée salon » (équipement ajaxSystem
+519) : `{"id": <id de la zone>, "eqType_name": "ajaxsiabe", "configuration":
+{"cloud_eqLogic": "519", "cloud_name": 1}}`.
 
 ## Journal SIA
 
@@ -205,6 +389,7 @@ Motifs de refus :
 | CRC faux, Illisible | Trame abîmée ou qui n'est pas du SIA DC-09. Une connexion qui en envoie cinq de suite est fermée. Une longueur annoncée fausse avec un CRC juste est acceptée et signalée par une icône. |
 | Refusé | Adresse absente de la liste des adresses autorisées. |
 | Doublon | Message réémis par le hub. Il reçoit un accusé de réception mais n'est traité qu'une fois. |
+| Jeedom | Pas une trame : ce que Jeedom a fait lui-même (ordre passé par le cloud, confirmation, nouvel essai, échec, alerte de la surveillance croisée). |
 
 ## Santé
 
@@ -223,6 +408,8 @@ supervision.
   zone et les envoyer en notification.
 - **Sur une alarme d'inondation** : fermer la vanne d'arrivée d'eau.
 - **Sur une perte de liaison** : prévenir par un autre canal que le cloud Ajax.
+- **Au départ de tous** : exécuter « Armer » du hub, sans se soucier du
+  cloud ; « Échec du dernier ordre » à 1 déclenche une notification.
 
 ## Sécurité
 

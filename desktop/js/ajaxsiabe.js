@@ -71,6 +71,15 @@ function ajaxsiabeToggleType() {
   document.querySelectorAll('.ajaxsiabeZoneBlock').forEach(function (el) {
     el.style.display = zone ? '' : 'none'
   })
+  /* L'onglet « Pilotage cloud » est caché pour une zone : s'il était ouvert
+     sur le hub précédent, on revient à l'onglet de l'équipement. */
+  var cloudPane = document.getElementById('cloudtab')
+  if (zone && cloudPane !== null && cloudPane.classList.contains('active')) {
+    var first = document.querySelector('a[href="#eqlogictab"]')
+    if (first !== null) {
+      first.click()
+    }
+  }
 }
 
 /* Remplit le bandeau d'état : une ligne par élément, en texte seulement. */
@@ -220,8 +229,158 @@ function printEqLogic(_eqLogic) {
   if (autozone !== null && !isset(configuration.autozone)) {
     autozone.checked = true
   }
+  var cloudName = document.querySelector('.eqLogicAttr[data-l2key="cloud_name"]')
+  if (cloudName !== null && !isset(configuration.cloud_name)) {
+    cloudName.checked = true
+  }
+  /* Table de correspondance vide : la table d'ajaxSystem, montrée telle
+     qu'elle s'applique. Enregistrée avec le hub au prochain « Sauvegarder ». */
+  var map = document.getElementById('ta_ajaxsiabeCloudMap')
+  if (map !== null && (configuration.type || 'hub') !== 'zone' && String(map.value).trim() === '') {
+    map.value = ajaxsiabeDefaultCloudMap
+  }
+  document.querySelectorAll('.ajaxsiabeActions').forEach(function (container) {
+    container.innerHTML = ''
+    var list = configuration[container.getAttribute('data-list')]
+    if (Array.isArray(list)) {
+      list.forEach(function (action) { ajaxsiabeAddAction(container.getAttribute('data-list'), action) })
+    }
+  })
   ajaxsiabeToggleType()
   ajaxsiabeShowSupervision(_eqLogic)
+  ajaxsiabeCloudSuggest()
+}
+
+/* Appelée par plugin.template.js avant l'enregistrement : les listes
+   d'actions ne sont pas des champs que data-lXkey sait ramasser. */
+function saveEqLogic(_eqLogic) {
+  if (!isset(_eqLogic.configuration)) {
+    _eqLogic.configuration = {}
+  }
+  if ((_eqLogic.configuration.type || 'hub') !== 'zone') {
+    document.querySelectorAll('.ajaxsiabeActions').forEach(function (container) {
+      var list = []
+      container.querySelectorAll('.ajaxsiabeAction').forEach(function (line) {
+        var action = line.getJeeValues('.expressionAttr')[0]
+        /* Options pas encore redessinées par le coeur : celles qu'on connaît,
+           plutôt que du vide à la place d'un message rédigé. */
+        if (isset(line.ajaxsiabePending) && line.ajaxsiabePending !== null) {
+          action.options = Object.assign({}, line.ajaxsiabePending, action.options)
+        }
+        list.push(action)
+      })
+      _eqLogic.configuration[container.getAttribute('data-list')] = list
+    })
+  }
+  return _eqLogic
+}
+
+function ajaxsiabeMarkModified() {
+  if (typeof jeeFrontEnd !== 'undefined') {
+    jeeFrontEnd.modifyWithoutSave = true
+  }
+  window.modifyWithoutSave = true
+}
+
+/* Une ligne d'action, calquée sur le sélecteur d'action des scénarios.
+   L'ordre html() → setJeeValues → appendChild est celui du coeur : le HTML
+   des options contient des <script> que seul Element.prototype.html()
+   exécute. */
+function ajaxsiabeAddAction(_list, _action) {
+  var container = document.querySelector('.ajaxsiabeActions[data-list="' + _list + '"]')
+  if (container === null) {
+    return null
+  }
+  var action = _action || {}
+  if (!isset(action.options)) {
+    action.options = {}
+  }
+  var div = '<div class="ajaxsiabeAction expression" style="margin-bottom:4px;">'
+  div += '<input class="expressionAttr" data-l1key="type" style="display:none;" value="action">'
+  div += '<div class="form-group" style="margin:0;">'
+  div += '<div class="col-sm-1">'
+  div += '<input type="checkbox" class="expressionAttr" data-l1key="options" data-l2key="enable" checked title="{{Décocher pour désactiver cette action sans la supprimer}}">'
+  div += '<input type="checkbox" class="expressionAttr" data-l1key="options" data-l2key="background" title="{{Exécuter en parallèle des autres actions}}">'
+  div += '</div>'
+  div += '<div class="col-sm-5">'
+  div += '<div class="input-group">'
+  div += '<span class="input-group-btn"><a class="btn btn-default btn-sm bt_ajaxsiabeRemoveAction roundedLeft" title="{{Supprimer}}"><i class="fas fa-minus-circle"></i></a></span>'
+  div += '<input class="expressionAttr form-control input-sm cmdAction" data-l1key="cmd" placeholder="{{Commande à déclencher}}">'
+  div += '<span class="input-group-btn">'
+  div += '<a class="btn btn-default btn-sm bt_ajaxsiabeListAction" title="{{Choisir un bloc (message, scénario, variable...)}}"><i class="fas fa-tasks"></i></a>'
+  div += '<a class="btn btn-default btn-sm bt_ajaxsiabeListCmd roundedRight" title="{{Choisir une commande}}"><i class="fas fa-list-alt"></i></a>'
+  div += '</span>'
+  div += '</div>'
+  div += '</div>'
+  div += '<div class="col-sm-6 actionOptions"></div>'
+  div += '</div>'
+  div += '</div>'
+  var wrapper = document.createElement('div')
+  wrapper.html(div)
+  wrapper.setJeeValues(action, '.expressionAttr')
+  container.appendChild(wrapper)
+  var nodes = Array.prototype.slice.call(wrapper.childNodes)
+  wrapper.replaceWith(...nodes)
+  if (nodes.length > 0) {
+    ajaxsiabeActionOptions(nodes[0], init(action.cmd, ''), action.options)
+  }
+  return nodes[0]
+}
+
+/* Titre, message… : c'est le coeur qui dessine les options, d'après la
+   commande visée. Variante asynchrone, pour ne pas figer l'onglet. */
+function ajaxsiabeActionOptions(_line, _expression, _options) {
+  var expression = String(init(_expression, ''))
+  if (_line.ajaxsiabeExpression === expression) {
+    return
+  }
+  _line.ajaxsiabeExpression = expression
+  _line.ajaxsiabePending = _options || {}
+  jeedom.cmd.displayActionOption(expression, _options, function (html) {
+    var target = _line.querySelector('.actionOptions')
+    if (target === null) {
+      return
+    }
+    if (html === 'Unsupported') {
+      target.textContent = '{{Ce bloc n\'est utilisable que dans un scénario.}}'
+      return
+    }
+    if (html === '' && expression !== '') {
+      target.textContent = '{{Options indisponibles : la commande visée a peut-être été supprimée. Le message enregistré est conservé.}}'
+      return
+    }
+    target.html(html)
+    jeedomUtils.taAutosize()
+    _line.ajaxsiabePending = null
+  })
+}
+
+/* Zone : suggestion d'appareil Ajax quand ajaxSystem porte le même numéro
+   d'équipement (champ rempli à la main dans ajaxSystem, seule donnée
+   commune avec le numéro de zone SIA). */
+function ajaxsiabeCloudSuggest() {
+  var span = document.getElementById('span_ajaxsiabeCloudSuggest')
+  var select = document.getElementById('sel_ajaxsiabeCloudDevice')
+  var number = document.querySelector('.eqLogicAttr[data-l2key="zone"]')
+  if (span === null || select === null || number === null) {
+    return
+  }
+  span.textContent = ''
+  if (select.value !== '' || String(number.value).trim() === '') {
+    return
+  }
+  var matches = Array.prototype.filter.call(select.options, function (option) {
+    return option.value !== '' && option.getAttribute('data-number') === String(number.value).trim()
+  })
+  if (matches.length === 1) {
+    span.textContent = '{{Suggestion : « Numéro de l\'équipement »}} ' + number.value + ' {{dans le plugin Ajax :}} ' + matches[0].textContent + '. '
+    var link = document.createElement('a')
+    link.href = '#'
+    link.className = 'bt_ajaxsiabeCloudSuggest'
+    link.setAttribute('data-id', matches[0].value)
+    link.textContent = '{{Lier}}'
+    span.appendChild(link)
+  }
 }
 
 /* Copie dans le presse-papiers. navigator.clipboard n'existe qu'en HTTPS ou
@@ -330,6 +489,81 @@ ajaxsiabeContainer.addEventListener('keydown', function (event) {
   }
 })
 ajaxsiabeContainer.addEventListener('click', function (event) {
+  var target
+  /* ---- pilotage par le cloud */
+  if ((target = event.target.closest('.bt_ajaxsiabePickCmd')) !== null) {
+    event.preventDefault()
+    var field = document.querySelector('.eqLogicAttr[data-l2key="' + target.getAttribute('data-key') + '"]')
+    /* Le sélecteur rend #[Objet][Équipement][Commande]# : le coeur le convertit
+       en identifiant à l'enregistrement, un renommage ne cassera rien. */
+    jeedom.cmd.getSelectModal({ cmd: { type: target.getAttribute('data-type') } }, function (result) {
+      if (!result || !result.human || field === null) {
+        return
+      }
+      field.value = result.human
+      ajaxsiabeMarkModified()
+    })
+    return
+  }
+  if ((target = event.target.closest('.bt_ajaxsiabeAddAction')) !== null) {
+    event.preventDefault()
+    ajaxsiabeAddAction(target.getAttribute('data-list'), null)
+    ajaxsiabeMarkModified()
+    return
+  }
+  if ((target = event.target.closest('.bt_ajaxsiabeRemoveAction')) !== null) {
+    target.closest('.ajaxsiabeAction').remove()
+    ajaxsiabeMarkModified()
+    return
+  }
+  if ((target = event.target.closest('.bt_ajaxsiabeListCmd')) !== null) {
+    var cmdLine = target.closest('.ajaxsiabeAction')
+    jeedom.cmd.getSelectModal({ cmd: { type: 'action' } }, function (result) {
+      cmdLine.querySelector('.expressionAttr[data-l1key="cmd"]').jeeValue(result.human)
+      ajaxsiabeActionOptions(cmdLine, result.human, '')
+      ajaxsiabeMarkModified()
+    })
+    return
+  }
+  if ((target = event.target.closest('.bt_ajaxsiabeListAction')) !== null) {
+    var blockLine = target.closest('.ajaxsiabeAction')
+    jeedom.getSelectActionModal({}, function (result) {
+      blockLine.querySelector('.expressionAttr[data-l1key="cmd"]').jeeValue(result.human)
+      ajaxsiabeActionOptions(blockLine, result.human, '')
+      ajaxsiabeMarkModified()
+    })
+    return
+  }
+  if (event.target.closest('#bt_ajaxsiabeCloudMapDefault')) {
+    event.preventDefault()
+    document.getElementById('ta_ajaxsiabeCloudMap').value = ajaxsiabeDefaultCloudMap
+    ajaxsiabeMarkModified()
+    return
+  }
+  if ((target = event.target.closest('.bt_ajaxsiabeCloudSuggest')) !== null) {
+    event.preventDefault()
+    document.getElementById('sel_ajaxsiabeCloudDevice').value = target.getAttribute('data-id')
+    ajaxsiabeCloudSuggest()
+    ajaxsiabeMarkModified()
+    return
+  }
+  if (event.target.closest('#bt_ajaxsiabeCloudCopy')) {
+    event.preventDefault()
+    var select = document.getElementById('sel_ajaxsiabeCloudDevice')
+    var option = select.options[select.selectedIndex]
+    if (!option || option.value === '') {
+      jeedomUtils.showAlert({ message: '{{Choisissez d\'abord l\'appareil Ajax.}}', level: 'warning' })
+      return
+    }
+    document.querySelector('.eqLogicAttr[data-l1key="name"]').value = option.getAttribute('data-name')
+    var objectField = document.querySelector('.eqLogicAttr[data-l1key="object_id"]')
+    if (objectField !== null) {
+      objectField.value = option.getAttribute('data-object') || ''
+    }
+    ajaxsiabeMarkModified()
+    jeedomUtils.showAlert({ message: '{{Nom et pièce repris : sauvegardez pour les appliquer.}}', level: 'success' })
+    return
+  }
   var copy = event.target.closest('.bt_ajaxsiabeCopy')
   if (copy !== null) {
     event.preventDefault()
@@ -347,6 +581,27 @@ ajaxsiabeContainer.addEventListener('click', function (event) {
   if (event.target.closest('#bt_ajaxsiabeConnectToggle')) {
     ajaxsiabeToggleConnect()
   }
+})
+
+/* Les lignes d'action ne sont pas des .eqLogicAttr : le coeur ne les voit pas
+   changer. Une commande tapée à la main voit ses options redessinées quand
+   on quitte le champ. */
+ajaxsiabeContainer.addEventListener('change', function (event) {
+  if (event.target.closest('.ajaxsiabeAction')) {
+    ajaxsiabeMarkModified()
+  }
+  if (event.target.id === 'sel_ajaxsiabeCloudDevice') {
+    ajaxsiabeCloudSuggest()
+  }
+})
+ajaxsiabeContainer.addEventListener('focusout', function (event) {
+  var input = event.target.closest('.ajaxsiabeAction .cmdAction')
+  if (input === null) {
+    return
+  }
+  var line = input.closest('.ajaxsiabeAction')
+  var current = line.getJeeValues('.expressionAttr')[0]
+  ajaxsiabeActionOptions(line, input.jeeValue(), init(current.options))
 })
 
 var ajaxsiabeConnectBody = document.getElementById('div_ajaxsiabeConnectBody')

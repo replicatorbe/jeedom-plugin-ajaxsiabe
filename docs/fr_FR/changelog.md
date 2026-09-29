@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.4 — 29/09/2026
+
+Une seule alarme dans Jeedom : le hub SIA pilote la centrale par le plugin
+officiel Ajax (cloud), et le SIA confirme.
+
+- Nouvelles actions « Armer », « Mode nuit », « Désarmer » (types génériques
+  d'alarme du coeur) et « Panique » : l'ordre part en tâche de fond par la
+  commande du plugin Ajax réglée dans le nouvel onglet « Pilotage cloud »,
+  sans bloquer l'appelant ; la trame SIA du nouveau mode le confirme. Sans
+  confirmation dans le délai (60 s) : un nouvel essai, puis un échec signalé
+  (message, actions d'alerte au choix). Rien n'est envoyé si le SIA indique
+  déjà le mode demandé. Un nouvel ordre remplace l'ordre en cours. Refus
+  explicite si aucune commande n'est réglée.
+- Nouvelles infos « Dernier ordre », « Ordre en cours », « Échec du dernier
+  ordre ».
+- Surveillance croisée SIA ↔ cloud : « État cloud » et « Cohérence cloud »,
+  alerte une fois par épisode au-delà d'une tolérance (2 min), retour à la
+  normale signalé, SIA muet alors que le cloud répond signalé comme tel. Le
+  mode du hub suit toujours le SIA seul.
+- Message de perte de liaison : dit si le cloud Ajax, lui, donne encore des
+  nouvelles.
+- Zones liées à un appareil du plugin Ajax : son nom sert dans les
+  événements et « Origine de l’alarme », bouton « Reprendre nom et pièce »,
+  suggestion d'après le « Numéro de l'équipement » d'ajaxSystem.
+- Journal SIA : les ordres, confirmations et alertes de Jeedom apparaissent
+  entre les trames.
+- Correction : la copie en base de l'état du hub (mode, alarmes, défauts)
+  n'était jamais relue après une coupure — le coeur la rend déjà décodée —
+  et elle était réécrite à chaque message, test de liaison compris.
+- Mise à jour : les hubs existants reçoivent les nouvelles commandes, leur
+  configuration n'est pas modifiée ; le pilotage reste inactif tant qu'il
+  n'est pas réglé.
+
 ## 0.3 — 29/09/2026
 
 Corrections après la mise en service sur un vrai hub Ajax.

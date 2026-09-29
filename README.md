@@ -11,12 +11,17 @@ télésurveillance : aucun cloud, aucun compte, aucune dépendance.
 - Hub et appareils créés tout seuls au premier message.
 - Journal de toutes les trames reçues, avec suivi en direct.
 - Supervision de la liaison avec le hub.
+- Avec le plugin officiel Ajax (cloud) : armement, mode nuit et désarmement
+  depuis ce hub, chaque ordre confirmé par le SIA, et surveillance croisée
+  des deux états.
 
 Documentation : [docs/fr_FR/index.md](docs/fr_FR/index.md)
 
 ## Développement
 
 - `php tests/test_codec.php` : jeu d'essai du codec SIA, sans Jeedom ni réseau.
+- `php tests/test_pilot.php` : pilotage par le cloud et surveillance croisée,
+  avec une doublure du coeur de Jeedom (aucun ordre réel, aucun équipement).
 - `php tests/test_daemon.php` : essai de bout en bout du démon contre un faux
   callback, sur des ports libres (quelques secondes).
 - `php tools/sia-send.php --demo` : simulateur de hub, qui envoie une séquence

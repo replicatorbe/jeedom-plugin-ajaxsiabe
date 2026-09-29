@@ -15,6 +15,12 @@ foreach ($eqLogics as $eqLogic) {
 		$hubs[] = $eqLogic;
 	}
 }
+/* Appareils du plugin ajaxSystem, pour lier une zone à son appareil du cloud.
+ * Rendus dans la page : la liste est courte et ne change qu'à la
+ * synchronisation d'ajaxSystem. */
+$cloudDevices = ajaxsiabe::cloudDevices();
+/* La table de correspondance du cloud par défaut, pour la préremplir. */
+sendVarToJS('ajaxsiabeDefaultCloudMap', ajaxsiabePilot::DEFAULT_CLOUD_MAP);
 ?>
 
 <div class="row row-overflow">
@@ -141,6 +147,7 @@ foreach ($eqLogics as $eqLogic) {
 		<ul class="nav nav-tabs" role="tablist">
 			<li role="presentation"><a href="#" class="eqLogicAction" aria-controls="home" role="tab" data-toggle="tab" data-action="returnToThumbnailDisplay"><i class="fas fa-arrow-circle-left"></i></a></li>
 			<li role="presentation" class="active"><a href="#eqlogictab" aria-controls="home" role="tab" data-toggle="tab"><i class="fas fa-tachometer-alt"></i><span class="hidden-xs"> {{Equipement}}</span></a></li>
+			<li role="presentation" class="ajaxsiabeHubBlock"><a href="#cloudtab" aria-controls="cloudtab" role="tab" data-toggle="tab"><i class="fas fa-cloud"></i><span class="hidden-xs"> {{Pilotage cloud}}</span></a></li>
 			<li role="presentation"><a href="#commandtab" aria-controls="home" role="tab" data-toggle="tab"><i class="fas fa-list"></i><span class="hidden-xs"> {{Commandes}}</span></a></li>
 		</ul>
 
@@ -282,6 +289,136 @@ foreach ($eqLogics as $eqLogic) {
 								<span class="help-block" style="margin:0;">{{Le numéro de l'appareil dans le hub Ajax, tel qu'il arrive dans les messages.}}</span>
 							</div>
 						</div>
+						<!-- Lien vers l'appareil du plugin ajaxSystem (cloud) : son nom sert
+						     dans les événements et « Origine de l'alarme ». Aucune donnée
+						     fiable ne relie d'elle-même un numéro de zone SIA à un appareil du
+						     cloud : le lien est manuel, avec une suggestion quand le « Numéro
+						     de l'équipement » est rempli dans ajaxSystem. -->
+						<div class="form-group">
+							<label class="col-sm-3 control-label">{{Appareil Ajax (cloud)}}</label>
+							<div class="col-sm-4">
+								<select class="eqLogicAttr form-control" id="sel_ajaxsiabeCloudDevice" data-l1key="configuration" data-l2key="cloud_eqLogic">
+									<option value="">{{Aucun}}</option>
+									<?php
+									foreach ($cloudDevices as $device) {
+										$label = $device['name'] . ($device['room'] !== '' ? ' — ' . $device['room'] : '') . ($device['type'] !== '' ? ' (' . $device['type'] . ')' : '');
+										echo '<option value="' . $device['id'] . '" data-name="' . htmlspecialchars($device['name']) . '" data-object="' . htmlspecialchars($device['object'])
+											. '" data-number="' . htmlspecialchars($device['number']) . '">' . htmlspecialchars($label) . '</option>';
+									}
+									?>
+								</select>
+							</div>
+							<div class="col-sm-4">
+								<a class="btn btn-default btn-sm" id="bt_ajaxsiabeCloudCopy" title="{{Recopie le nom et la pièce (objet parent) de l'appareil Ajax dans cet équipement. Sauvegardez ensuite.}}"><i class="fas fa-file-import"></i> {{Reprendre nom et pièce}}</a>
+							</div>
+						</div>
+						<div class="form-group">
+							<label class="col-sm-3 control-label">{{Nom Ajax dans les événements}}</label>
+							<div class="col-sm-2">
+								<input type="checkbox" class="eqLogicAttr" data-l1key="configuration" data-l2key="cloud_name" checked>
+							</div>
+							<div class="col-sm-6">
+								<span class="help-block" style="margin:0;">{{Coché, le nom de l'appareil lié (tel que le cloud Ajax le connaît, renommages compris) sert dans « Origine de l'alarme », « Dernière zone » et les événements. Décoché, c'est le nom de cet équipement.}} <?php echo empty($cloudDevices) ? '{{Aucun appareil du plugin Ajax (ajaxSystem) trouvé.}}' : ''; ?></span>
+								<span class="help-block" id="span_ajaxsiabeCloudSuggest" style="margin:0;"></span>
+							</div>
+						</div>
+					</fieldset>
+				</form>
+			</div>
+
+			<!-- ====================== PILOTAGE PAR LE CLOUD ===================== -->
+			<!-- Le SIA ne va que du hub vers Jeedom : les ordres passent par le
+			     plugin ajaxSystem (cloud Ajax), et c'est le SIA qui les confirme.
+			     Tout est vide par défaut : sans commande réglée, les actions du hub
+			     refusent l'ordre au lieu de faire semblant. -->
+			<div role="tabpanel" class="tab-pane" id="cloudtab">
+				<br>
+				<div class="alert alert-info">
+					{{Le SIA ne permet pas de commander la centrale : « Armer », « Mode nuit », « Désarmer » et « Panique » exécutent la commande du plugin Ajax (cloud) réglée ici, puis attendent que le hub confirme le nouveau mode par le SIA. Sans confirmation dans le délai, l'ordre est renvoyé, puis déclaré en échec : « Échec du dernier ordre » passe à 1, un message apparaît et les actions ci-dessous sont jouées. Si le SIA indique déjà le mode demandé, rien n'est envoyé.}}
+				</div>
+				<form class="form-horizontal">
+					<fieldset>
+						<legend><i class="fas fa-paper-plane"></i> {{Ordres}}</legend>
+						<div class="table-responsive">
+							<table class="table table-condensed" style="max-width:980px;">
+								<thead>
+									<tr>
+										<th style="width:140px;">{{Ordre}}</th>
+										<th>{{Commande du cloud à exécuter}}</th>
+										<th style="width:130px;">{{Délai de confirmation (s)}}</th>
+										<th style="width:110px;">{{Nouvel(s) essai(s)}}</th>
+									</tr>
+								</thead>
+								<tbody>
+									<?php
+									$orders = array('arm' => '{{Armer}}', 'night' => '{{Mode nuit}}', 'disarm' => '{{Désarmer}}', 'panic' => '{{Panique (facultatif)}}');
+									foreach ($orders as $key => $label) {
+										echo '<tr>';
+										echo '<td>' . $label . '</td>';
+										echo '<td><div class="input-group">';
+										echo '<input class="eqLogicAttr form-control input-sm roundedLeft" data-l1key="configuration" data-l2key="order_' . $key . '_cmd" placeholder="{{ex. #[Maison][Ajax hub][Armement]#}}">';
+										echo '<span class="input-group-btn"><a class="btn btn-default btn-sm bt_ajaxsiabePickCmd roundedRight" data-type="action" data-key="order_' . $key . '_cmd" title="{{Choisir une commande}}"><i class="fas fa-list-alt"></i></a></span>';
+										echo '</div></td>';
+										echo '<td><input type="number" min="10" max="3600" class="eqLogicAttr form-control input-sm" data-l1key="configuration" data-l2key="order_' . $key . '_delay" placeholder="60"></td>';
+										echo '<td><input type="number" min="0" max="5" class="eqLogicAttr form-control input-sm" data-l1key="configuration" data-l2key="order_' . $key . '_retries" placeholder="1"></td>';
+										echo '</tr>';
+									}
+									?>
+								</tbody>
+							</table>
+						</div>
+						<span class="help-block">{{Avec le plugin Ajax (ajaxSystem) : commandes « Armement », « Mode nuit », « Desarmement » et « Panic » de son hub. Le délai est vérifié chaque minute : compter jusqu'à une minute de plus. La commande du cloud est lancée en tâche de fond : l'action du hub rend la main aussitôt.}}</span>
+					</fieldset>
+
+					<fieldset>
+						<legend><i class="fas fa-bell"></i> {{Actions en cas d'échec d'un ordre}}
+							<a class="btn btn-default btn-xs pull-right bt_ajaxsiabeAddAction" data-list="order_actions"><i class="fas fa-plus-circle"></i> {{Ajouter une action}}</a>
+						</legend>
+						<span class="help-block">{{Jouées une fois quand un ordre reste sans confirmation du SIA après tous ses essais. Balises : #ordre# (Armer…), #mode# (mode visé), #hub#, #essais#, #message# (phrase complète).}}</span>
+						<div class="ajaxsiabeActions" data-list="order_actions"></div>
+					</fieldset>
+
+					<fieldset>
+						<legend><i class="fas fa-balance-scale"></i> {{Surveillance croisée SIA et cloud}}</legend>
+						<div class="form-group">
+							<label class="col-sm-3 control-label">{{Commande d'état du cloud}}</label>
+							<div class="col-sm-5">
+								<div class="input-group">
+									<input class="eqLogicAttr form-control roundedLeft" data-l1key="configuration" data-l2key="cloud_state_cmd" placeholder="{{ex. #[Maison][Ajax hub][Etat]#}}">
+									<span class="input-group-btn"><a class="btn btn-default bt_ajaxsiabePickCmd roundedRight" data-type="info" data-key="cloud_state_cmd" title="{{Choisir une commande}}"><i class="fas fa-list-alt"></i></a></span>
+								</div>
+							</div>
+							<div class="col-sm-4">
+								<span class="help-block" style="margin:0;">{{Vide : pas de surveillance. Le mode du hub suit toujours le SIA seul ; le cloud n'est que comparé.}}</span>
+							</div>
+						</div>
+						<div class="form-group">
+							<label class="col-sm-3 control-label">{{Tolérance (min)}}</label>
+							<div class="col-sm-2">
+								<input type="number" min="0" step="0.5" class="eqLogicAttr form-control" data-l1key="configuration" data-l2key="cloud_tolerance" placeholder="2">
+							</div>
+							<div class="col-sm-6">
+								<span class="help-block" style="margin:0;">{{Écart toléré avant alerte : le cloud suit souvent le SIA avec retard. Pas de comparaison pendant un ordre en cours.}}</span>
+							</div>
+						</div>
+						<div class="form-group">
+							<label class="col-sm-3 control-label">{{Correspondance des valeurs}}</label>
+							<div class="col-sm-4">
+								<textarea class="eqLogicAttr form-control" id="ta_ajaxsiabeCloudMap" rows="8" data-l1key="configuration" data-l2key="cloud_state_map" style="font-family:monospace;"></textarea>
+							</div>
+							<div class="col-sm-4">
+								<span class="help-block" style="margin:0;">{{Une ligne par valeur du cloud : valeur=mode, le mode étant Désarmé, Armé, Mode nuit ou Armé partiel (ou disarmed, armed, night, partial). Vide : la table du plugin Ajax (ajaxSystem), préremplie ici. Une valeur absente (PANIC, inconnue) n'est jamais comparée.}}</span>
+								<a class="btn btn-default btn-xs" id="bt_ajaxsiabeCloudMapDefault"><i class="fas fa-undo"></i> {{Table par défaut}}</a>
+							</div>
+						</div>
+					</fieldset>
+
+					<fieldset>
+						<legend><i class="fas fa-exclamation-triangle"></i> {{Actions en cas de divergence}}
+							<a class="btn btn-default btn-xs pull-right bt_ajaxsiabeAddAction" data-list="cloud_actions"><i class="fas fa-plus-circle"></i> {{Ajouter une action}}</a>
+						</legend>
+						<span class="help-block">{{Jouées une fois par épisode quand le SIA et le cloud divergent au-delà de la tolérance (ou que le SIA se tait alors que le cloud répond), puis une fois au retour à la normale. Balises : #hub#, #mode# (mode SIA), #etat_cloud#, #coherent# (0 à l'alerte, 1 au retour), #message#.}}</span>
+						<div class="ajaxsiabeActions" data-list="cloud_actions"></div>
 					</fieldset>
 				</form>
 			</div>

@@ -18,6 +18,9 @@
 require_once __DIR__ . '/../../../../core/php/core.inc.php';
 /* Le codec est partagé avec le démon : dictionnaire des codes et libellés. */
 require_once __DIR__ . '/../../resources/ajaxsiabed/AjaxSiaCodec.php';
+/* Décisions du pilotage par le cloud, sans dépendance au coeur (voir le
+ * fichier) : chargées ici, l'autoload du coeur ne les trouverait pas. */
+require_once __DIR__ . '/ajaxsiabePilot.class.php';
 
 class ajaxsiabe extends eqLogic {
 
@@ -34,6 +37,11 @@ class ajaxsiabe extends eqLogic {
     /* Hubs créés automatiquement, au plus : un émetteur qui inventerait des
      * numéros de compte ne doit pas pouvoir remplir Jeedom d'équipements. */
     const AUTO_HUBS_MAX = 5;
+
+    /* Le plugin officiel qui parle au cloud Ajax : le seul qui sache donner un
+     * ordre à la centrale. Jamais modifié par celui-ci, seulement lu (ses
+     * appareils, sa commande d'état) et appelé (ses commandes d'armement). */
+    const CLOUD_PLUGIN = 'ajaxSystem';
 
     /* Un seul rechargement du démon par requête, même si dix équipements sont enregistrés. */
     private static $_reloadScheduled = false;
@@ -97,7 +105,29 @@ class ajaxsiabe extends eqLogic {
         array('logicalId' => 'last_category', 'name' => 'Catégorie du dernier événement', 'type' => 'info', 'subType' => 'string', 'repeat' => 1, 'isVisible' => 0),
         array('logicalId' => 'last_event',   'name' => 'Dernier événement',      'type' => 'info',   'subType' => 'string', 'repeat' => 1),
         array('logicalId' => 'last_code',    'name' => 'Dernier code SIA',       'type' => 'info',   'subType' => 'string', 'repeat' => 1, 'isVisible' => 0),
+        /*
+         * Pilotage par le cloud (0.4). Le SIA ne sait pas commander la
+         * centrale : ces actions passent l'ordre à la commande du plugin
+         * ajaxSystem choisie dans l'onglet « Pilotage cloud », puis attendent
+         * que le SIA le confirme. Leurs types génériques sont ceux d'une
+         * alarme pour le coeur : Google Home, JeedomConnect ou un scénario
+         * pilotent ainsi l'alarme par ce seul équipement.
+         */
+        array('logicalId' => 'order_arm',      'name' => 'Armer',                  'type' => 'action', 'subType' => 'other',  'generic_type' => 'ALARM_ARMED'),
+        array('logicalId' => 'order_night',    'name' => 'Mode nuit',              'type' => 'action', 'subType' => 'other',  'generic_type' => 'ALARM_SET_MODE'),
+        array('logicalId' => 'order_disarm',   'name' => 'Désarmer',               'type' => 'action', 'subType' => 'other',  'generic_type' => 'ALARM_RELEASED'),
+        array('logicalId' => 'order_panic',    'name' => 'Panique',                'type' => 'action', 'subType' => 'other',  'isVisible' => 0),
+        array('logicalId' => 'order_last',     'name' => 'Dernier ordre',          'type' => 'info',   'subType' => 'string'),
+        array('logicalId' => 'order_pending',  'name' => 'Ordre en cours',         'type' => 'info',   'subType' => 'binary', 'initial' => 0),
+        array('logicalId' => 'order_failed',   'name' => 'Échec du dernier ordre', 'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1, 'invert' => 1, 'initial' => 0),
+        array('logicalId' => 'cloud_state',    'name' => 'État cloud',             'type' => 'info',   'subType' => 'string'),
+        array('logicalId' => 'cloud_coherent', 'name' => 'Cohérence cloud',        'type' => 'info',   'subType' => 'binary', 'isHistorized' => 1),
     );
+
+    /* Blocs d'action refusés dans les actions d'alerte : ils retiendraient le
+     * cron (attente, question) ou n'ont de sens que dans un scénario. */
+    const REFUSED_BLOCKS = array('wait', 'sleep', 'ask', 'report', 'exportHistory',
+                                 'stop', 'log', 'scenario_return', 'icon', 'tag');
 
     /*
      * Une commande binaire par famille d'alarme : un scénario « incendie →
@@ -590,7 +620,37 @@ class ajaxsiabe extends eqLogic {
 
     public function zoneName($_number) {
         $zone = $this->zone((int) $_number);
-        return is_object($zone) ? $zone->getName() : __('zone', __FILE__) . ' ' . (int) $_number;
+        if (!is_object($zone)) {
+            return __('zone', __FILE__) . ' ' . (int) $_number;
+        }
+        /* Zone liée à un appareil du plugin ajaxSystem : son nom Ajax, tenu à
+         * jour par la synchronisation du cloud, sert dans les événements et
+         * dans « Origine de l'alarme ». Un renommage dans l'application Ajax
+         * suit donc sans rien toucher ici. */
+        if ($zone->getConfiguration('cloud_name', 1) == 1) {
+            $device = $zone->cloudDevice();
+            if (is_object($device)) {
+                return $device->getName();
+            }
+        }
+        return $zone->getName();
+    }
+
+    /* Appareils du plugin ajaxSystem déjà lus pendant cette requête. */
+    private static $_cloudDevices = array();
+
+    /* L'équipement ajaxSystem lié à cette zone, ou null. Contrôlé : byId()
+     * chargerait n'importe quel équipement de Jeedom. */
+    public function cloudDevice() {
+        $id = (int) $this->getConfiguration('cloud_eqLogic');
+        if ($id <= 0) {
+            return null;
+        }
+        if (!array_key_exists($id, self::$_cloudDevices)) {
+            $device = eqLogic::byId($id);
+            self::$_cloudDevices[$id] = (is_object($device) && $device->getEqType_name() == self::CLOUD_PLUGIN) ? $device : null;
+        }
+        return self::$_cloudDevices[$id];
     }
 
     public function groupName($_ri) {
@@ -668,7 +728,7 @@ class ajaxsiabe extends eqLogic {
         if (!is_array($state)) {
             /* Cache perdu (coupure de courant : le coeur ne le sauve que toutes
              * les 30 minutes) : la copie en base fait foi. */
-            $state = json_decode((string) config::byKey('state::' . $this->getId(), __CLASS__, ''), true);
+            $state = self::storedJson('state::' . $this->getId());
         }
         $state = is_array($state) ? $state : array();
         foreach (array('alarms', 'tamper', 'battery', 'battery_missing', 'link', 'groups') as $key) {
@@ -692,9 +752,23 @@ class ajaxsiabe extends eqLogic {
     private function saveState($_state) {
         cache::set('ajaxsiabe::state::' . $this->getId(), $_state);
         $json = json_encode($_state);
-        if ($json !== config::byKey('state::' . $this->getId(), __CLASS__, '')) {
+        if ($json !== json_encode(self::storedJson('state::' . $this->getId()))) {
             config::save('state::' . $this->getId(), $json, __CLASS__);
         }
+    }
+
+    /*
+     * Copie en base d'un état (JSON), ou null. config::byKey() rend une valeur
+     * JSON déjà décodée (is_json() du coeur) : la relire avec json_decode()
+     * donnait « Array », si bien que la copie n'était jamais relue après une
+     * coupure et qu'elle était réécrite à chaque message (0.3).
+     */
+    private static function storedJson($_key) {
+        $value = config::byKey($_key, __CLASS__, '');
+        if (is_string($value) && $value !== '') {
+            $value = json_decode($value, true);
+        }
+        return is_array($value) ? $value : null;
     }
 
     /* Publie une valeur seulement si elle change : le coeur traite toujours une
@@ -893,6 +967,14 @@ class ajaxsiabe extends eqLogic {
                 if (is_object($zone)) {
                     $zone->checkAndUpdateCmd('alarm', 1);
                 }
+                /* Une panique demandée par le cloud est confirmée par l'alarme
+                 * panique que le hub transmet. */
+                foreach (self::$_alarmFamilies['alarm_panic'] as $panicType) {
+                    if ($type === __($panicType, __FILE__)) {
+                        $this->orderSeen('panic');
+                        break;
+                    }
+                }
             }
 
             if (!empty($effects['restore'])) {
@@ -1069,6 +1151,9 @@ class ajaxsiabe extends eqLogic {
         if ($global == 'disarmed') {
             $this->clearAlarms($_state, 'Intrusion');
         }
+
+        /* Le SIA a parlé : c'est lui qui confirme un ordre passé par le cloud. */
+        $this->orderSeen($global);
     }
 
     /*
@@ -1215,10 +1300,25 @@ class ajaxsiabe extends eqLogic {
     }
 
     public static function cron() {
+        $daemonUp = (self::deamon_info()['state'] == 'ok');
+
+        /* Échéances des ordres et surveillance croisée d'abord, démon arrêté
+         * ou non : un ordre que personne ne confirme doit finir en alerte même
+         * quand c'est le récepteur qui est tombé, sinon nul ne saurait que la
+         * maison n'est peut-être pas armée. */
+        foreach (self::byTypeAndSearchConfiguration(__CLASS__, array('type' => self::TYPE_HUB), true) as $hub) {
+            try {
+                $hub->processOrders();
+                $hub->evaluateCloud($daemonUp);
+            } catch (Throwable $e) {
+                log::add(__CLASS__, 'error', $hub->getHumanName() . ' ' . __('pilotage cloud en échec :', __FILE__) . ' ' . $e->getMessage());
+            }
+        }
+
         /* Démon arrêté : c'est le récepteur qui est sourd, pas le hub qui s'est
          * tu. Accuser le hub déclencherait de fausses alertes. Le coeur relance
          * lui-même un démon arrêté quand la gestion automatique est active. */
-        if (self::deamon_info()['state'] != 'ok') {
+        if (!$daemonUp) {
             return;
         }
         self::checkListening();
@@ -1245,7 +1345,7 @@ class ajaxsiabe extends eqLogic {
                      * alarme qui ne préviendrait plus personne. */
                     message::add(__CLASS__, $hub->getHumanName() . ' ' . __('ne donne plus de nouvelles depuis', __FILE__) . ' '
                                . round((time() - $last) / 60) . ' min. '
-                               . __('Vérifiez son alimentation et sa connexion réseau.', __FILE__), '', 'linkLost' . $hub->getId());
+                               . __('Vérifiez son alimentation et sa connexion réseau.', __FILE__) . $hub->cloudNews(), '', 'linkLost' . $hub->getId());
                 }
             } catch (Throwable $e) {
                 log::add(__CLASS__, 'error', __('Supervision en échec :', __FILE__) . ' ' . $e->getMessage());
@@ -1273,6 +1373,531 @@ class ajaxsiabe extends eqLogic {
             message::removeAll(__CLASS__, 'deaf');
             cache::set('ajaxsiabe::deafNotified', 0);
         }
+    }
+
+    /* ============================================== PILOTAGE PAR LE CLOUD */
+
+    /*
+     * Une alarme unique dans Jeedom : ce hub. Il reçoit les événements par le
+     * SIA, et il donne ses ordres par le plugin ajaxSystem, le seul qui sache
+     * parler au cloud Ajax (le SIA ne va que du hub vers Jeedom).
+     *
+     * Cycle d'un ordre : la commande du cloud part en tâche de fond, l'ordre
+     * attendu est mémorisé (cache et base), et c'est la trame SIA du nouveau
+     * mode qui le confirme. Le cron (chaque minute) traite les échéances :
+     * nouvel essai, puis alerte. Les décisions sont dans ajaxsiabePilot ; ici,
+     * seulement ce qui touche à Jeedom.
+     */
+
+    /* Réglages d'un ordre, bornés. */
+    public function orderSettings($_key) {
+        return array(
+            'cmd'     => trim((string) $this->getConfiguration('order_' . $_key . '_cmd')),
+            'delay'   => ajaxsiabePilot::delay($this->getConfiguration('order_' . $_key . '_delay')),
+            'retries' => ajaxsiabePilot::retries($this->getConfiguration('order_' . $_key . '_retries')),
+        );
+    }
+
+    /*
+     * La commande du cloud qui exécute un ordre. Chaque refus a son motif : un
+     * ordre d'armement qui ne part pas doit le dire, pas disparaître.
+     */
+    private function cloudOrderCmd($_expression) {
+        $expression = trim((string) $_expression);
+        if ($expression === '') {
+            throw new Exception(__('aucune commande du cloud n\'est configurée pour cet ordre (onglet « Pilotage cloud » du hub)', __FILE__));
+        }
+        $id = ajaxsiabePilot::cmdIdOf($expression);
+        if ($id === null) {
+            throw new Exception(__('commande du cloud illisible :', __FILE__) . ' ' . $expression);
+        }
+        $cmd = cmd::byId($id);
+        if (!is_object($cmd)) {
+            throw new Exception(__('commande du cloud introuvable (supprimée ?) :', __FILE__) . ' #' . $id . '#');
+        }
+        if ($cmd->getType() != 'action') {
+            throw new Exception(__('ce n\'est pas une commande d\'action :', __FILE__) . ' ' . $cmd->getHumanName());
+        }
+        /* « Armer » réglé sur lui-même, ou sur l'action d'un autre hub SIA :
+         * l'ordre se renverrait sans fin, sans jamais atteindre la centrale. */
+        if ($cmd->getEqType() == __CLASS__) {
+            throw new Exception(__('la commande appartient au plugin Ajax SIA, qui ne sait pas commander la centrale :', __FILE__) . ' ' . $cmd->getHumanName());
+        }
+        return $cmd;
+    }
+
+    /* Mode rapporté en dernier par le SIA (clé de $_armingLabels), ou null. */
+    public function siaMode() {
+        $cmd = $this->getCmd('info', 'arming');
+        $value = is_object($cmd) ? (string) $cmd->execCmd() : '';
+        foreach (self::$_armingLabels as $key => $label) {
+            if ($value === __($label, __FILE__)) {
+                return $key;
+            }
+        }
+        return null;
+    }
+
+    /* L'ordre mémorisé, ou null. Cache pour la lecture, base pour survivre à
+     * un redémarrage de Jeedom au milieu d'un ordre, comme l'état. */
+    private function loadOrder() {
+        $order = cache::byKey('ajaxsiabe::order::' . $this->getId())->getValue(null);
+        if (!is_array($order)) {
+            $order = self::storedJson('order::' . $this->getId());
+        }
+        if (!is_array($order) || !isset($order['key'], $order['status']) || !isset(ajaxsiabePilot::$_targets[$order['key']])) {
+            return null;
+        }
+        return $order;
+    }
+
+    /* Un tableau vide dans le cache vaut « rien en attente » : sans lui, un
+     * cache vide renverrait à la copie en base, peut-être plus ancienne. */
+    private function saveOrder($_order) {
+        $order = is_array($_order) ? $_order : array();
+        cache::set('ajaxsiabe::order::' . $this->getId(), $order);
+        $stored = self::storedJson('order::' . $this->getId());
+        if ($stored === null ? !empty($order) : (json_encode($stored) !== json_encode($order))) {
+            if (empty($order)) {
+                config::remove('order::' . $this->getId(), __CLASS__);
+            } else {
+                config::save('order::' . $this->getId(), json_encode($order), __CLASS__);
+            }
+        }
+    }
+
+    private function publishOrder($_result) {
+        if (isset($_result['text'])) {
+            $this->checkAndUpdateCmd('order_last', $_result['text']);
+        }
+        if (isset($_result['pending'])) {
+            $this->updateIfChanged('order_pending', $_result['pending']);
+        }
+        if (isset($_result['failed'])) {
+            $this->updateIfChanged('order_failed', $_result['failed']);
+        }
+    }
+
+    /*
+     * Donne un ordre : 'arm', 'night', 'disarm' ou 'panic'. Rend aussitôt,
+     * sans attendre le cloud ni la confirmation : l'appelant (scénario,
+     * JeedomConnect, Google Home) ne doit pas rester bloqué une minute.
+     *
+     * Seule une action explicite arrive ici (commande du hub, page) : aucun
+     * événement reçu, ni du SIA ni du cloud, ne donne d'ordre, et surtout pas
+     * de désarmer. Seul le cron renvoie un ordre déjà donné, faute de
+     * confirmation.
+     */
+    public function sendOrder($_key) {
+        if ($this->getConfiguration('type') != self::TYPE_HUB || !isset(ajaxsiabePilot::$_targets[$_key])) {
+            throw new Exception(__('Ordre inconnu :', __FILE__) . ' ' . $_key);
+        }
+        $label = __(ajaxsiabePilot::$_orderLabels[$_key], __FILE__);
+        $settings = $this->orderSettings($_key);
+        try {
+            $cloud = $this->cloudOrderCmd($settings['cmd']);
+        } catch (Exception $e) {
+            /* Refus propre : dit dans « Dernier ordre », au journal, et à
+             * l'appelant. Un ordre déjà en attente n'est pas touché. */
+            $text = $label . ' — ' . __('refusé', __FILE__) . ' : ' . $e->getMessage();
+            log::add(__CLASS__, 'warning', $this->getHumanName() . ' ' . $text);
+            $this->journalNote($text);
+            $this->checkAndUpdateCmd('order_last', $text);
+            throw new Exception($this->getHumanName() . ' ' . $text);
+        }
+
+        /* Sous verrou : une trame SIA qui arrive au même instant doit trouver
+         * l'ordre déjà mémorisé, ou pas du tout, jamais à moitié. */
+        self::lock();
+        try {
+            $result = ajaxsiabePilot::start($_key, $settings, $this->siaMode(), time(), $this->loadOrder());
+            $this->saveOrder($result['order']);
+        } finally {
+            self::unlock();
+        }
+        $this->publishOrder($result);
+        /* Un nouvel ordre tourne la page de l'échec précédent. */
+        message::removeAll(__CLASS__, 'orderFailed' . $this->getId());
+
+        $text = $result['text'];
+        if ($result['replaced'] !== '') {
+            $text .= ' — ' . __('remplace l\'ordre en attente', __FILE__) . ' « ' . __($result['replaced'], __FILE__) . ' »';
+        }
+        log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . __('ordre', __FILE__) . ' ' . $text
+               . ($result['send'] ? ' → ' . $cloud->getHumanName() : ''));
+        $this->journalNote($text);
+        if ($result['send']) {
+            $this->runCloud($cloud);
+        }
+        return $result;
+    }
+
+    /*
+     * Exécute la commande du cloud en tâche de fond. ajaxSystem::request()
+     * peut attendre la réponse du cloud 60 s, trois fois, et dormir jusqu'à
+     * 30 s avant de réessayer : ni l'appelant ni le cron n'ont à l'attendre,
+     * c'est le SIA qui dira si l'ordre a pris.
+     */
+    private function runCloud($_cmd) {
+        log::add(__CLASS__, 'debug', $this->getHumanName() . ' → ' . $_cmd->getHumanName() . ' ' . __('(en tâche de fond)', __FILE__));
+        scenarioExpression::createAndExec('action', '#' . $_cmd->getId() . '#', array('background' => 1));
+    }
+
+    /*
+     * Le SIA vient de rapporter un mode (ou une alarme panique). Appelée sous
+     * le verrou des états, pendant l'application de l'événement : les
+     * commandes partent avec les autres, après l'enregistrement de l'état.
+     */
+    private function orderSeen($_mode) {
+        $order = $this->loadOrder();
+        if ($order === null) {
+            return;
+        }
+        $result = ajaxsiabePilot::confirm($order, $_mode, time());
+        if ($result === null) {
+            if ($order['status'] === 'pending') {
+                log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . __('le SIA annonce', __FILE__) . ' « '
+                       . __(ajaxsiabePilot::modeLabel($_mode), __FILE__) . ' » ' . __('pendant l\'ordre', __FILE__) . ' « '
+                       . __(ajaxsiabePilot::$_orderLabels[$order['key']], __FILE__) . ' » : ' . __('attente de la confirmation poursuivie', __FILE__));
+            }
+            return;
+        }
+        $this->saveOrder(null);
+        $this->publishOrder($result);
+        message::removeAll(__CLASS__, 'orderFailed' . $this->getId());
+        log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . __('ordre', __FILE__) . ' ' . $result['text']);
+        $this->journalNote($result['text']);
+    }
+
+    /* Passage du cron : nouvel essai ou échec d'un ordre non confirmé. */
+    public function processOrders() {
+        $result = null;
+        $cloud = null;
+        self::lock();
+        try {
+            $order = $this->loadOrder();
+            $result = ajaxsiabePilot::tick($order, $this->siaMode(), time());
+            if ($result !== null) {
+                if ($result['send']) {
+                    /* Relue à chaque essai : la commande a pu disparaître ou
+                     * changer depuis l'ordre. */
+                    try {
+                        $cloud = $this->cloudOrderCmd($this->orderSettings($order['key'])['cmd']);
+                    } catch (Exception $e) {
+                        $result = ajaxsiabePilot::abort($order, $e->getMessage(), time());
+                    }
+                }
+                $this->saveOrder($result['order']);
+            }
+        } finally {
+            self::unlock();
+        }
+        if ($result === null || empty($result['publish'])) {
+            return $result;
+        }
+        $this->publishOrder($result);
+        log::add(__CLASS__, $result['alert'] ? 'warning' : 'info', $this->getHumanName() . ' ' . __('ordre', __FILE__) . ' ' . $result['text']);
+        $this->journalNote($result['text']);
+        if ($result['send'] && is_object($cloud)) {
+            $this->runCloud($cloud);
+        }
+        if ($result['alert']) {
+            $this->orderAlert($order, $result['text']);
+        }
+        return $result;
+    }
+
+    /* Un ordre que le SIA n'a pas confirmé : actions d'alerte du hub, et un
+     * message au centre de messages, visible même sans action réglée. */
+    private function orderAlert($_order, $_text) {
+        $tags = array(
+            '#hub#'     => $this->getName(),
+            '#ordre#'   => __(ajaxsiabePilot::$_orderLabels[$_order['key']], __FILE__),
+            '#mode#'    => __(ajaxsiabePilot::modeLabel($_order['target']), __FILE__),
+            '#essais#'  => (string) (int) $_order['attempt'],
+            '#message#' => $this->getName() . ' : ' . $_text,
+        );
+        $this->runActions('order_actions', $tags);
+        message::add(__CLASS__, $this->getHumanName() . ' : ' . $_text . '. '
+                   . __('Vérifiez l\'état de l\'alarme dans l\'application Ajax.', __FILE__), '', 'orderFailed' . $this->getId());
+    }
+
+    /* =================================================== SURVEILLANCE CROISÉE */
+
+    /* La commande d'état du cloud, ou null si elle n'est pas réglée ou plus
+     * lisible. */
+    private function cloudStateCmd() {
+        $id = ajaxsiabePilot::cmdIdOf($this->getConfiguration('cloud_state_cmd'));
+        if ($id === null) {
+            return null;
+        }
+        $cmd = cmd::byId($id);
+        return (is_object($cmd) && $cmd->getType() == 'info') ? $cmd : null;
+    }
+
+    /*
+     * Compare le mode du SIA à l'état du cloud, publie « État cloud » et
+     * « Cohérence cloud », et alerte une fois par épisode de divergence qui
+     * dure au-delà de la tolérance. Appelée par le cron et, dès que l'état du
+     * cloud change, par l'écouteur (pullCloud).
+     *
+     * Jamais l'inverse : le mode du hub ne suit pas le cloud. Le SIA vient du
+     * hub, en une seconde et signé de sa clé ; le cloud arrive tard, parfois
+     * pas du tout. Basculer « Mode » sur sa foi, c'est risquer de montrer
+     * « Désarmé » une maison armée.
+     */
+    public function evaluateCloud($_daemonUp = null) {
+        $cmd = $this->cloudStateCmd();
+        if ($cmd === null) {
+            return null;
+        }
+        $raw = trim((string) $cmd->execCmd());
+        $cloud = ajaxsiabePilot::cloudMode(ajaxsiabePilot::parseCloudMap($this->getConfiguration('cloud_state_map')), $raw);
+        $this->updateIfChanged('cloud_state', ($cloud !== null) ? __(ajaxsiabePilot::modeLabel($cloud), __FILE__)
+                                              : (($raw === '') ? '' : __('Inconnu', __FILE__) . ' (' . $raw . ')'));
+
+        /* Le SIA se tait : récepteur arrêté, ou liaison déclarée perdue par
+         * la supervision. Son dernier mode n'est alors plus une certitude. */
+        if ($_daemonUp === null) {
+            $_daemonUp = (self::deamon_info()['state'] == 'ok');
+        }
+        $link = $this->getCmd('info', 'link');
+        $silent = !$_daemonUp || (is_object($link) && (string) $link->execCmd() === '0');
+        $sia = $this->siaMode();
+
+        self::lock();
+        try {
+            $order = $this->loadOrder();
+            $pending = is_array($order) && $order['status'] === 'pending';
+            $episode = cache::byKey('ajaxsiabe::cloud::' . $this->getId())->getValue(array());
+            $result = ajaxsiabePilot::cloudCheck($episode, $sia, $cloud, $silent, $pending, time(),
+                                                  ajaxsiabePilot::tolerance($this->getConfiguration('cloud_tolerance')));
+            cache::set('ajaxsiabe::cloud::' . $this->getId(), $result['episode']);
+        } finally {
+            self::unlock();
+        }
+        if ($result['coherent'] !== null) {
+            $this->updateIfChanged('cloud_coherent', $result['coherent']);
+        }
+        if ($result['alert'] === null && !$result['recovered']) {
+            return $result;
+        }
+
+        $siaLabel = ($sia !== null) ? __(ajaxsiabePilot::modeLabel($sia), __FILE__) : '';
+        $cloudLabel = ($cloud !== null) ? __(ajaxsiabePilot::modeLabel($cloud), __FILE__) : $raw;
+        if ($result['recovered']) {
+            $text = __('SIA et cloud Ajax de nouveau d\'accord', __FILE__) . ' (« ' . $siaLabel . ' »)';
+            log::add(__CLASS__, 'info', $this->getHumanName() . ' ' . $text);
+            message::removeAll(__CLASS__, 'cloudDiverge' . $this->getId());
+        } elseif ($result['alert'] === 'silent') {
+            $text = __('le SIA se tait (liaison perdue ou récepteur arrêté) alors que le cloud Ajax répond et indique', __FILE__)
+                  . ' « ' . $cloudLabel . ' » ; ' . __('dernier mode reçu par le SIA :', __FILE__) . ' « ' . $siaLabel . ' ». '
+                  . __('Le mode du hub n\'est pas changé : le SIA fait foi.', __FILE__);
+        } else {
+            $text = __('le SIA indique', __FILE__) . ' « ' . $siaLabel . ' », ' . __('le cloud Ajax', __FILE__) . ' « ' . $cloudLabel . ' » '
+                  . __('depuis', __FILE__) . ' ' . self::duration(time() - (int) $result['episode']['since']) . '. '
+                  . __('Le SIA fait foi ; vérifiez l\'alarme dans l\'application Ajax.', __FILE__);
+        }
+        if (!$result['recovered']) {
+            log::add(__CLASS__, 'warning', $this->getHumanName() . ' ' . $text);
+            message::add(__CLASS__, $this->getHumanName() . ' : ' . $text, '', 'cloudDiverge' . $this->getId());
+        }
+        $this->journalNote(__('Surveillance du cloud :', __FILE__) . ' ' . $text);
+        $this->runActions('cloud_actions', array(
+            '#hub#'        => $this->getName(),
+            '#mode#'       => $siaLabel,
+            '#etat_cloud#' => $cloudLabel,
+            '#coherent#'   => $result['recovered'] ? '1' : '0',
+            '#message#'    => $this->getName() . ' : ' . $text,
+        ));
+        return $result;
+    }
+
+    /* Écouteur de la commande d'état du cloud : l'état cloud est mis à jour
+     * dès qu'il change, sans attendre le cron. */
+    public static function pullCloud($_option) {
+        $hub = self::byId(isset($_option['hub_id']) ? (int) $_option['hub_id'] : 0);
+        if (!is_object($hub) || $hub->getEqType_name() != __CLASS__ || $hub->getIsEnable() != 1
+            || $hub->getConfiguration('type') != self::TYPE_HUB) {
+            return;
+        }
+        try {
+            $hub->evaluateCloud();
+        } catch (Throwable $e) {
+            log::add(__CLASS__, 'error', $hub->getHumanName() . ' ' . __('surveillance du cloud en échec :', __FILE__) . ' ' . $e->getMessage());
+        }
+    }
+
+    /* L'écouteur suit la commande d'état choisie : reconstruit à chaque
+     * enregistrement du hub, retiré s'il n'y en a plus. */
+    private function syncCloudListener() {
+        $listener = listener::byClassAndFunction(__CLASS__, 'pullCloud', array('hub_id' => intval($this->getId())));
+        $id = ajaxsiabePilot::cmdIdOf($this->getConfiguration('cloud_state_cmd'));
+        if ($this->getIsEnable() != 1 || $id === null || $this->getConfiguration('type') != self::TYPE_HUB) {
+            if (is_object($listener)) {
+                $listener->remove();
+            }
+            return;
+        }
+        if (!is_object($listener)) {
+            $listener = new listener();
+            $listener->setClass(__CLASS__);
+            $listener->setFunction('pullCloud');
+            $listener->setOption(array('hub_id' => intval($this->getId())));
+        }
+        $listener->emptyEvent();
+        $listener->addEvent($id);
+        $listener->save();
+    }
+
+    /*
+     * Dernier signe de vie du cloud pour ce hub : la communication la plus
+     * récente d'un équipement ajaxSystem du même hub Ajax. Ajouté au message
+     * de perte de liaison : un hub muet en SIA mais vivant dans le cloud,
+     * c'est un problème de réseau local, pas une centrale éteinte.
+     */
+    public function cloudNews() {
+        $cmd = $this->cloudStateCmd();
+        if ($cmd === null) {
+            return '';
+        }
+        $eqLogic = $cmd->getEqLogic();
+        if (!is_object($eqLogic)) {
+            return '';
+        }
+        $ajaxHub = ($eqLogic->getConfiguration('type') == 'hub') ? $eqLogic->getLogicalId() : $eqLogic->getConfiguration('hub_id');
+        $last = 0;
+        foreach (eqLogic::byType($eqLogic->getEqType_name()) as $other) {
+            if ($ajaxHub != '' && ($other->getLogicalId() == $ajaxHub || $other->getConfiguration('hub_id') == $ajaxHub)) {
+                $time = strtotime((string) $other->getStatus('lastCommunication'));
+                $last = max($last, ($time === false) ? 0 : $time);
+            }
+        }
+        if ($last <= 0) {
+            return ' ' . __('Le cloud Ajax n\'a pas donné de nouvelles non plus.', __FILE__);
+        }
+        return ' ' . __('Le cloud Ajax, lui, a donné signe de vie il y a', __FILE__) . ' ' . self::duration(time() - $last)
+             . ' (' . __('état', __FILE__) . ' : ' . (string) $cmd->execCmd() . ').';
+    }
+
+    /* ================================================== ACTIONS D'ALERTE */
+
+    /* Les listes d'actions, au format du sélecteur des scénarios. Une ligne
+     * sans commande est retirée : elle ne ferait rien. */
+    public static function cleanActions($_actions) {
+        $clean = array();
+        if (!is_array($_actions)) {
+            return $clean;
+        }
+        foreach ($_actions as $action) {
+            if (!is_array($action) || !isset($action['cmd']) || trim((string) $action['cmd']) === '') {
+                continue;
+            }
+            $clean[] = array(
+                'cmd'     => trim((string) $action['cmd']),
+                'options' => (isset($action['options']) && is_array($action['options'])) ? $action['options'] : array(),
+            );
+        }
+        return $clean;
+    }
+
+    /*
+     * Joue une liste d'actions ('order_actions' ou 'cloud_actions') avec les
+     * balises du moment. Une action en échec ne retient pas les suivantes :
+     * une notification cassée ne doit pas empêcher la sirène.
+     */
+    public function runActions($_key, $_tags) {
+        foreach (self::cleanActions($this->getConfiguration($_key, array())) as $action) {
+            $options = $action['options'];
+            if (isset($options['enable']) && $options['enable'] == 0) {
+                continue;
+            }
+            /* Les jetons du coeur d'abord, les nôtres ensuite : dans l'autre
+             * sens, un message contenant « (4 s) » serait relu comme une
+             * expression. */
+            $scenario = null;
+            foreach ($options as $name => $value) {
+                if (!is_string($value) || $name === 'enable' || $name === 'background') {
+                    continue;
+                }
+                $value = scenarioExpression::setTags($value, $scenario);
+                $options[$name] = str_replace(array_keys($_tags), array_values($_tags), $value);
+            }
+            try {
+                $expression = $action['cmd'];
+                if (in_array($expression, self::REFUSED_BLOCKS, true)) {
+                    throw new Exception(__('bloc inutilisable ici :', __FILE__) . ' ' . $expression);
+                }
+                $id = ajaxsiabePilot::cmdIdOf($expression);
+                if ($id === null || (isset($options['background']) && $options['background'] == 1)) {
+                    /* Un bloc (message, scénario, variable) ou une commande à
+                     * lancer en parallèle : le primitif du coeur. */
+                    $options['source'] = $this->getHumanName();
+                    scenarioExpression::createAndExec('action', $expression, $options);
+                    continue;
+                }
+                $cmd = cmd::byId($id);
+                if (!is_object($cmd) || $cmd->getType() != 'action') {
+                    throw new Exception(__('commande d\'action introuvable :', __FILE__) . ' ' . $expression);
+                }
+                unset($options['enable'], $options['background']);
+                $cmd->execCmd($options);
+            } catch (Throwable $e) {
+                log::add(__CLASS__, 'error', $this->getHumanName() . ' ' . __('action en échec :', __FILE__) . ' '
+                       . $action['cmd'] . ' — ' . $e->getMessage());
+            }
+        }
+    }
+
+    /* Une ligne du journal SIA pour ce que Jeedom a fait lui-même (ordre,
+     * confirmation, alerte) : lu entre les trames, l'ordre et sa confirmation
+     * se suivent. Même fichier et même format que le démon. */
+    public function journalNote($_text) {
+        $dir = self::journalDir();
+        if (!is_dir($dir)) {
+            return;
+        }
+        $entry = array(
+            't'       => round(microtime(true), 3),
+            'status'  => 'jeedom',
+            'peer'    => 'Jeedom',
+            'proto'   => 'local',
+            'account' => strtoupper((string) $this->getConfiguration('account')),
+            'note'    => (string) $_text,
+        );
+        @file_put_contents($dir . '/' . date('Y-m-d') . '.jsonl',
+                           json_encode($entry, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n", FILE_APPEND | LOCK_EX);
+    }
+
+    /* Appareils du plugin ajaxSystem, pour lier une zone. Le numéro
+     * d'équipement (« device_number ») est un champ que l'utilisateur remplit
+     * lui-même dans ajaxSystem : c'est la seule donnée commune avec le numéro
+     * de zone SIA, d'où une suggestion et non une liaison automatique. */
+    public static function cloudDevices() {
+        $devices = array();
+        try {
+            foreach (eqLogic::byType(self::CLOUD_PLUGIN) as $eqLogic) {
+                if ($eqLogic->getConfiguration('type') != 'device') {
+                    continue;
+                }
+                $object = $eqLogic->getObject();
+                $devices[] = array(
+                    'id'       => (int) $eqLogic->getId(),
+                    'name'     => $eqLogic->getName(),
+                    'object'   => (string) $eqLogic->getObject_id(),
+                    'room'     => is_object($object) ? $object->getName() : '',
+                    'type'     => (string) $eqLogic->getConfiguration('device'),
+                    'number'   => (string) $eqLogic->getConfiguration('device_number'),
+                    'hub'      => (string) $eqLogic->getConfiguration('hub_id'),
+                );
+            }
+        } catch (Throwable $e) {
+            /* Plugin absent ou désactivé : pas d'appareil à proposer. */
+        }
+        usort($devices, function ($_a, $_b) {
+            return strcasecmp($_a['name'], $_b['name']);
+        });
+        return $devices;
     }
 
     /* ============================================================ SANTÉ */
@@ -1492,11 +2117,12 @@ class ajaxsiabe extends eqLogic {
             if (!is_array($entry)) {
                 continue;
             }
-            $entry += array('status' => '', 'type' => '', 'account' => '', 'events' => array(), 'error' => '', 'peer' => '', 'warning' => '');
+            $entry += array('status' => '', 'type' => '', 'account' => '', 'events' => array(), 'error' => '', 'peer' => '', 'warning' => '', 'note' => '');
             if ($account !== '' && $entry['account'] !== $account) {
                 continue;
             }
-            if ($problems && in_array($entry['status'], array('ok', 'duplicate'))) {
+            /* Les lignes de Jeedom (ordres, confirmations) ne sont pas des refus. */
+            if ($problems && in_array($entry['status'], array('ok', 'duplicate', 'jeedom'))) {
                 continue;
             }
             if (!$tests && in_array($entry['status'], array('ok', 'duplicate')) && self::isPeriodicTest($entry)) {
@@ -1520,6 +2146,9 @@ class ajaxsiabe extends eqLogic {
             $entry['hubId'] = is_object($hub) ? (int) $hub->getId() : 0;
             if ($entry['type'] == 'NULL') {
                 $texts[] = __('Test de liaison', __FILE__);
+            }
+            if ($entry['status'] === 'jeedom') {
+                $texts[] = $entry['note'];
             }
             $entry['text'] = implode(' · ', $texts);
             $entry['time'] = isset($entry['t']) ? date('H:i:s', (int) $entry['t']) : '';
@@ -1585,6 +2214,15 @@ class ajaxsiabe extends eqLogic {
                 }
             }
             $this->setLogicalId($account);
+            /* Listes d'actions du pilotage nettoyées, seulement si elles
+             * existent : un hub d'avant la 0.4 ne reçoit aucune clé nouvelle
+             * tant qu'on ne configure pas son pilotage. */
+            foreach (array('order_actions', 'cloud_actions') as $key) {
+                $actions = $this->getConfiguration($key, null);
+                if ($actions !== null && $actions !== '') {
+                    $this->setConfiguration($key, self::cleanActions($actions));
+                }
+            }
         } else {
             $hubId = (int) $this->getConfiguration('hub_id');
             $number = (int) $this->getConfiguration('zone');
@@ -1634,6 +2272,8 @@ class ajaxsiabe extends eqLogic {
         /* Toujours, et pas seulement pour un hub : un hub devenu zone doit
          * sortir de la configuration du démon, avec sa clé. */
         self::reloadDaemonConfig();
+        self::$_cloudDevices = array();
+        $this->syncCloudListener();
     }
 
     /* Hub en cours de suppression : ses zones partent avec lui sans rien
@@ -1650,11 +2290,18 @@ class ajaxsiabe extends eqLogic {
             }
             /* Ici et pas dans postRemove() : le coeur a déjà effacé l'id quand
              * il l'appelle. */
-            foreach (array('state', 'contact', 'lasttest', 'intervals') as $key) {
+            foreach (array('state', 'contact', 'lasttest', 'intervals', 'order', 'cloud') as $key) {
                 cache::delete('ajaxsiabe::' . $key . '::' . $id);
             }
             config::remove('state::' . $id, __CLASS__);
-            message::removeAll(__CLASS__, 'linkLost' . $id);
+            config::remove('order::' . $id, __CLASS__);
+            foreach (array('linkLost', 'orderFailed', 'cloudDiverge') as $message) {
+                message::removeAll(__CLASS__, $message . $id);
+            }
+            $listener = listener::byClassAndFunction(__CLASS__, 'pullCloud', array('hub_id' => $id));
+            if (is_object($listener)) {
+                $listener->remove();
+            }
         }
     }
 
@@ -1713,10 +2360,16 @@ class ajaxsiabeCmd extends cmd {
         if (!is_object($eqLogic)) {
             return;
         }
-        if ($this->getLogicalId() == 'reset_alarm') {
+        $logicalId = $this->getLogicalId();
+        if ($logicalId == 'reset_alarm') {
             $eqLogic->resetAlarm();
-        } elseif ($this->getLogicalId() == 'reset_faults') {
+        } elseif ($logicalId == 'reset_faults') {
             $eqLogic->resetFaults();
+        } elseif (strpos($logicalId, 'order_') === 0 && isset(ajaxsiabePilot::$_targets[substr($logicalId, 6)])) {
+            /* Armer, Mode nuit, Désarmer, Panique : l'ordre part par le cloud
+             * et la commande rend la main aussitôt. Un refus (pas de commande
+             * cloud configurée) remonte à l'appelant sous forme d'erreur. */
+            $eqLogic->sendOrder(substr($logicalId, 6));
         }
     }
 }

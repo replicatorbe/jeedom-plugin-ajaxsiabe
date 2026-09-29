@@ -26,7 +26,10 @@ var ajaxsiabeJournalStatus = {
   decrypt: { label: '{{Clé fausse}}', css: 'danger' },
   crc: { label: '{{CRC faux}}', css: 'danger' },
   format: { label: '{{Illisible}}', css: 'danger' },
-  refused: { label: '{{Refusé}}', css: 'danger' }
+  refused: { label: '{{Refusé}}', css: 'danger' },
+  /* Pas une trame : ce que Jeedom a fait lui-même (ordre passé par le cloud,
+     confirmation par le SIA, alerte de la surveillance croisée). */
+  jeedom: { label: '{{Jeedom}}', css: 'primary' }
 }
 
 /* Numéro de la dernière requête partie, et signature du dernier rendu. */
@@ -60,6 +63,9 @@ function ajaxsiabeJournalDetail(_entry) {
   }
   if (_entry.warning) {
     lines.push('{{Remarque}} : ' + _entry.warning)
+  }
+  if (_entry.note) {
+    lines.push('{{Jeedom}} : ' + _entry.note)
   }
   if (_entry.reply) {
     lines.push('{{Réponse}} : ' + _entry.reply)
@@ -173,7 +179,7 @@ function ajaxsiabeJournalRender(_result) {
       warn.style.marginLeft = '5px'
       statusCell.appendChild(warn)
     }
-    if (entry.status !== 'ok' && entry.status !== 'duplicate') {
+    if (entry.status !== 'ok' && entry.status !== 'duplicate' && entry.status !== 'jeedom') {
       row.classList.add('warning')
     }
     tbody.appendChild(row)
