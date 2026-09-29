@@ -193,6 +193,17 @@ check('caractère de contrôle neutralisé', AjaxSiaCodec::clean("a\nb\x01") ===
 check('Contact ID 3456 : armement partiel', AjaxSiaCodec::parseContactId('3456 02 000')[0]['code'] === 'CG');
 check('Contact ID 3402 : armement de groupe', AjaxSiaCodec::describe(AjaxSiaCodec::parseContactId('3402 02 000')[0]['code'])['e']['arm'] === 'armed');
 check('Contact ID 1384 : pile faible', AjaxSiaCodec::parseContactId('1384 01 007')[0]['code'] === 'XT');
+/* Sens Ajax (table officielle des codes d'événements des hubs). */
+check('Ajax : capot du hub (1145) = sabotage', AjaxSiaCodec::parseContactId('1145 00 000')[0]['code'] === 'TA');
+check('Ajax : notifications du capot coupées (1383) ≠ sabotage', AjaxSiaCodec::parseContactId('1383 01 004')[0]['code'] === 'TB');
+check('Ajax : désarmement au clavier (1409) = OP', AjaxSiaCodec::parseContactId('1409 01 005')[0]['code'] === 'OP');
+check('Ajax : désarmement sous contrainte (1423) = HA', AjaxSiaCodec::parseContactId('1423 01 005')[0]['code'] === 'HA');
+check('Ajax : mode nuit de groupe (3442) = NL', AjaxSiaCodec::parseContactId('3442 01 005')[0]['code'] === 'NL');
+check('Ajax : NC = mode nuit par scénario', AjaxSiaCodec::describe('NC')['e']['arm'] === 'night');
+check('Ajax : NP porte un utilisateur, pas une zone', AjaxSiaCodec::describe('NP')['a'] === 'u');
+check('Ajax : AF ne crée pas de zone', AjaxSiaCodec::describe('AF')['a'] !== 'z');
+check('Ajax : OR acquitte, ne désarme pas', !isset(AjaxSiaCodec::describe('OR')['e']['arm']) && AjaxSiaCodec::describe('OR')['e']['cancel'] === 'latched');
+check('Ajax : YA = batterie reconnectée', AjaxSiaCodec::describe('YA')['e']['battery'] === 0);
 check('Contact ID inconnu : code vide, numéro gardé', AjaxSiaCodec::parseContactId('1999 01 001')[0]['code'] === '' && AjaxSiaCodec::parseContactId('1999 01 001')[0]['cid'] === '1999');
 
 /* Dictionnaire. */

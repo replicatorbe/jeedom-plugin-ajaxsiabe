@@ -806,6 +806,12 @@ class ajaxsiabe extends eqLogic {
                 }
             }
         }
+        /* CG vaut « Armé partiel » pour le système entier, mais « Armé » pour
+         * le groupe qu'il nomme : sinon des groupes tous armés un à un
+         * donneraient encore « Armé partiel ». */
+        if ($group != 0 && $_mode === 'partial') {
+            $_mode = 'armed';
+        }
         if ($group == 0) {
             $_state['groups'] = array('0' => $_mode);
         } else {

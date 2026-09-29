@@ -14,6 +14,20 @@ Corrections après la mise en service sur un vrai hub Ajax.
 - Supervision automatique : attend trois intervalles de test mesurés. Le
   premier test suit l'enregistrement des réglages dans Ajax PRO et ne donne
   pas le vrai rythme.
+- Codes alignés sur la table officielle des codes d'événements d'Ajax :
+  NC (mode nuit par scénario, pris pour un état du réseau), NP (mode nuit
+  désactivé par un utilisateur, qui créait une zone), AF (armement par
+  scénario, qui créait une zone), OR (acquittement après alarme, pris pour
+  un désarmement), HV (agression confirmée, absent), SM/SC (appareil
+  déplacé : sabotage), YA (batterie reconnectée), chambre de fumée,
+  court-circuit, firmware, liaison photo.
+- Contact ID selon Ajax : capot du hub (145), clavier et badge (409, qui
+  créaient une zone), contrainte (423, pris pour une porte forcée),
+  notifications du capot coupées (383, prises pour un sabotage), mode nuit
+  de groupe (442), et 129, 139, 142, 154, 300, 305, 306, 308, 330, 337,
+  353, 354, 389, 391, 393, 406, 455, 461, 550, 570, 573, 627, 750.
+- Armement de groupe (CG) : le groupe nommé est « Armé », le hub « Armé
+  partiel » seulement si d'autres groupes ne le sont pas.
 
 ## 0.2 — 27/09/2026
 
