@@ -125,11 +125,17 @@ class AjaxSiaDaemon {
      * au-delà, c'est la fenêtre de la norme qui s'applique. L'écart est gardé
      * sur disque pour qu'un redémarrage ne le fasse pas réapprendre à coups
      * de NAK.
+     *
+     * Ce hub dérive en outre d'environ +6 s par jour (+161 s le 21/10/2026) :
+     * à 120 s, la limite faisait retomber la correction et cesser les mesures
+     * (écart > CLOCK_MAX + WINDOW_PAST) au bout de quelques semaines. 600 s
+     * laissent des mois de marge ; la garde contre une mesure aberrante reste
+     * la concordance de trois mesures autour de la médiane.
      */
     const CLOCK_SAMPLES = 5;         // mesures gardées par compte
     const CLOCK_MIN     = 3;         // mesures avant de corriger
     const CLOCK_SPREAD  = 10;        // écart admis autour de la médiane, en s
-    const CLOCK_MAX     = 120;       // décalage au-delà duquel on ne corrige pas
+    const CLOCK_MAX     = 600;       // décalage au-delà duquel on ne corrige pas
 
     private $opt;
     private $config = array();
@@ -409,8 +415,46 @@ class AjaxSiaDaemon {
         if (is_resource($this->control)) {
             fclose($this->control);
         }
+        $this->flushPushOnExit();
         @unlink($this->opt['pid']);
         return 0;
+    }
+
+    /*
+     * Événements déjà accusés au hub mais pas encore remis à Jeedom : le hub
+     * ne les renverra pas, un redémarrage les perdrait. On laisse finir l'envoi
+     * en vol, puis on remet le reste d'un envoi direct. Le tout tient dans les
+     * dix secondes que deamon_stop() accorde avant le kill -9.
+     */
+    private function flushPushOnExit() {
+        if ($this->pushPid > 0) {
+            for ($i = 0; $i < 16; $i++) {
+                $done = pcntl_waitpid($this->pushPid, $status, WNOHANG);
+                if ($done !== 0) {
+                    if ($done > 0) {
+                        $this->pushFinished($status);
+                    } else {
+                        $this->pushPid = 0;   // déjà récolté : son lot est réglé
+                    }
+                    break;
+                }
+                usleep(250000);
+            }
+        }
+        if ($this->pushPid > 0) {
+            /* Toujours en vol : il finira seul, son lot avec lui. */
+            return;
+        }
+        if (empty($this->pushQueue)) {
+            return;
+        }
+        $count = count($this->pushQueue);
+        if ($this->callback('', array('events' => $this->pushQueue), 4, 1) === false) {
+            SiaLog::error($count . ' événement(s) non remis à Jeedom à l\'arrêt du démon');
+        } else {
+            SiaLog::info($count . ' événement(s) en attente remis à Jeedom avant l\'arrêt');
+        }
+        $this->pushQueue = array();
     }
 
     private function loop() {

@@ -229,6 +229,16 @@ $status = order('status');
 check('état : horloge du hub +33 s', isset($status['result']['clock']['5A5A']) && abs($status['result']['clock']['5A5A'] - 33) <= 1);
 check('horloge gardée sur disque', strpos((string) @file_get_contents($dir . '/p/data/clock.json'), '5A5A') !== false);
 
+/* Hub qui dérive (+6 s par jour, vu à +161 s) : l'écart doit rester appris
+ * au-delà de deux minutes, sinon ses messages chiffrés seraient tous refusés. */
+foreach (array(50, 51, 52) as $seq) {
+    usleep(1100000);
+    exchange(AjaxSiaCodec::build('SIA-DCS', $seq, '5A5A', 'Nri1/CL' . $seq, $key, time() + 161));
+}
+usleep(1100000);
+check('hub à +161 s : accepté une fois son horloge réapprise',
+      ackType(exchange(AjaxSiaCodec::build('SIA-DCS', 53, '5A5A', 'Nri1/OP53', $key, time() + 161))) === '*ACK');
+
 /* Connexions muettes : elles ne doivent pas rendre le récepteur sourd. */
 $mute = array();
 for ($i = 0; $i < 40; $i++) {

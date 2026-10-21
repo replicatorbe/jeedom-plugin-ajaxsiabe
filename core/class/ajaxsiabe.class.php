@@ -112,10 +112,16 @@ class ajaxsiabe extends eqLogic {
          * que le SIA le confirme. Leurs types génériques sont ceux d'une
          * alarme pour le coeur : Google Home, JeedomConnect ou un scénario
          * pilotent ainsi l'alarme par ce seul équipement.
+         *
+         * 'value' lie l'action à l'info qui montre son effet : Armée pour
+         * Armer et Désarmer, Mode pour Mode nuit (Armée vaut 1 aussi en mode
+         * nuit). Ces infos ne suivent que le SIA, jamais l'ordre lui-même :
+         * l'action affiche donc l'état confirmé par la centrale, pas l'état
+         * demandé.
          */
-        array('logicalId' => 'order_arm',      'name' => 'Armer',                  'type' => 'action', 'subType' => 'other',  'generic_type' => 'ALARM_ARMED'),
-        array('logicalId' => 'order_night',    'name' => 'Mode nuit',              'type' => 'action', 'subType' => 'other',  'generic_type' => 'ALARM_SET_MODE'),
-        array('logicalId' => 'order_disarm',   'name' => 'Désarmer',               'type' => 'action', 'subType' => 'other',  'generic_type' => 'ALARM_RELEASED'),
+        array('logicalId' => 'order_arm',      'name' => 'Armer',                  'type' => 'action', 'subType' => 'other',  'generic_type' => 'ALARM_ARMED',    'value' => 'armed'),
+        array('logicalId' => 'order_night',    'name' => 'Mode nuit',              'type' => 'action', 'subType' => 'other',  'generic_type' => 'ALARM_SET_MODE', 'value' => 'arming'),
+        array('logicalId' => 'order_disarm',   'name' => 'Désarmer',               'type' => 'action', 'subType' => 'other',  'generic_type' => 'ALARM_RELEASED', 'value' => 'armed'),
         array('logicalId' => 'order_panic',    'name' => 'Panique',                'type' => 'action', 'subType' => 'other',  'isVisible' => 0),
         array('logicalId' => 'order_last',     'name' => 'Dernier ordre',          'type' => 'info',   'subType' => 'string'),
         array('logicalId' => 'order_pending',  'name' => 'Ordre en cours',         'type' => 'info',   'subType' => 'binary', 'initial' => 0),
@@ -230,18 +236,68 @@ class ajaxsiabe extends eqLogic {
         return false;
     }
 
+    /*
+     * Arrêt propre : SIGTERM, puis jusqu'à dix secondes pour que le démon
+     * remette à Jeedom les événements déjà accusés au hub, garde l'horloge des
+     * hubs sur disque et ferme ses ports, puis kill -9 s'il traîne.
+     * system::kill() enchaînait SIGTERM et kill -9 sans attendre : ce ménage
+     * n'avait jamais lieu, et deamon_start() relançait aussitôt, au risque de
+     * trouver un port encore pris (« Address already in use »). On ne rend la
+     * main qu'une fois le port d'ordres et le port SIA libres.
+     */
     public static function deamon_stop() {
         $pid_file = jeedom::getTmpFolder(__CLASS__) . '/deamon.pid';
         if (file_exists($pid_file)) {
-            $pid = intval(trim(file_get_contents($pid_file)));
-            if ($pid > 0) {
-                system::kill($pid);
+            $pid = (int) trim(file_get_contents($pid_file));
+            if ($pid > 0 && self::isDaemonPid($pid)) {
+                posix_kill($pid, 15);
+                for ($i = 0; $i < 40 && self::isDaemonPid($pid); $i++) {
+                    usleep(250000);
+                }
+                if (self::isDaemonPid($pid)) {
+                    posix_kill($pid, 9);
+                }
             }
             @unlink($pid_file);
         }
-        // Filet de sécurité si le fichier PID a disparu alors que le process tourne.
-        system::kill('resources/ajaxsiabed/ajaxsiabed.php');
-        system::fuserk(config::byKey('socketport', __CLASS__, 55065));
+        /* Filet de sécurité si le fichier PID a disparu alors que le process
+         * tourne — et pour un fils d'envoi encore en vol, qui porte la même
+         * ligne de commande. */
+        if (count(system::ps('resources/ajaxsiabed/ajaxsiabed.php')) > 0) {
+            system::kill('resources/ajaxsiabed/ajaxsiabed.php', false);
+            for ($i = 0; $i < 20 && count(system::ps('resources/ajaxsiabed/ajaxsiabed.php')) > 0; $i++) {
+                usleep(250000);
+            }
+            if (count(system::ps('resources/ajaxsiabed/ajaxsiabed.php')) > 0) {
+                system::kill('resources/ajaxsiabed/ajaxsiabed.php');
+            }
+        }
+        $control = (int) config::byKey('socketport', __CLASS__, 55065);
+        system::fuserk((string) $control);
+        self::waitPortFree('tcp://127.0.0.1:' . $control);
+        self::waitPortFree('tcp://0.0.0.0:' . (int) config::byKey('port', __CLASS__, 7777));
+    }
+
+    /* Le PID est-il toujours notre démon ? Après un kill -9, il a pu être réattribué à un autre processus. */
+    private static function isDaemonPid($_pid) {
+        $cmdline = @file_get_contents('/proc/' . (int) $_pid . '/cmdline');
+        return $cmdline !== false && strpos($cmdline, 'ajaxsiabed.php') !== false;
+    }
+
+    /* Attend jusqu'à dix secondes que l'adresse se lie de nouveau, comme le
+     * démon la liera : le noyau peut garder le port un instant après la mort
+     * du process. */
+    private static function waitPortFree($_address) {
+        for ($i = 0; $i < 40; $i++) {
+            $probe = @stream_socket_server($_address, $errno, $errstr);
+            if ($probe !== false) {
+                fclose($probe);
+                return true;
+            }
+            usleep(250000);
+        }
+        log::add(__CLASS__, 'warning', __('Port du démon toujours occupé après l\'arrêt :', __FILE__) . ' ' . $_address);
+        return false;
     }
 
     public static function getCallbackUrl() {
@@ -2261,6 +2317,17 @@ class ajaxsiabe extends eqLogic {
              * le coeur ignore toute mise à jour d'un équipement désactivé. */
             if (isset($definition['initial']) && $this->getIsEnable() == 1 && $cmd->execCmd() === '') {
                 $this->checkAndUpdateCmd($cmd, $definition['initial']);
+            }
+            /* Lien action → info, posé tant qu'il est vide : à la création, et
+             * pour les hubs créés avant qu'il existe. Un lien choisi à la main
+             * n'est pas écrasé. Les infos liées précèdent les actions dans la
+             * liste, elles existent donc déjà ici. */
+            if (isset($definition['value']) && $cmd->getValue() == '') {
+                $info = $this->getCmd('info', $definition['value']);
+                if (is_object($info)) {
+                    $cmd->setValue($info->getId());
+                    $cmd->save();
+                }
             }
         }
         /* Commandes de l'autre type, laissées par un changement de type. */

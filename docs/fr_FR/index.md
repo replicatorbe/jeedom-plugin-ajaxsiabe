@@ -75,7 +75,7 @@ nombre de trames reçues, heure du dernier message de chaque hub.
 | Port de réception | Port sur lequel les hubs envoient leurs messages (7777 par défaut, TCP). |
 | Écouter aussi en UDP | Inutile pour Ajax, qui émet en TCP. En UDP, l'adresse d'un émetteur peut être usurpée. |
 | Clé de chiffrement | La clé générale : elle sert aux hubs qui n'ont pas la leur. Dès qu'une clé s'applique à un hub, ses messages en clair sont refusés. |
-| Refuser les messages mal datés | Coché par défaut, et à laisser coché : c'est la protection de la norme contre le rejeu d'une trame capturée. Une horloge de hub qui avance ou retarde de façon stable (2 minutes au plus) est mesurée et corrigée d'elle-même. Ne décocher que si le journal montre des refus « Mal daté » répétés. |
+| Refuser les messages mal datés | Coché par défaut, et à laisser coché : c'est la protection de la norme contre le rejeu d'une trame capturée. Une horloge de hub qui avance ou retarde de façon stable (10 minutes au plus) est mesurée et corrigée d'elle-même. Ne décocher que si le journal montre des refus « Mal daté » répétés. |
 | Adresses autorisées | Adresses IP exactes des hubs, séparées par des virgules : ni plage, ni masque, ni nom d'hôte (une entrée invalide est refusée à l'enregistrement). Vide : tout émetteur est accepté. |
 | Créer les hubs inconnus | Crée un hub au premier message d'un numéro de compte inconnu, cinq au plus. Décoché, ces messages sont accusés et gardés au journal, et le hub se crée à la main. |
 | Journal conservé | Nombre de jours de journal SIA gardés, 50 Mo par jour au plus. |
@@ -385,7 +385,7 @@ Motifs de refus :
 | En clair | Message non chiffré pour un compte dont la clé est connue : refusé, sans réponse. C'est ce qui empêche une machine du réseau de simuler un désarmement. |
 | Clé fausse | Message chiffré que ni la clé du hub ni la clé générale ne déchiffrent. |
 | Sans heure | Message chiffré sans horodatage, que la norme interdit. |
-| Mal daté | Message chiffré daté de plus de 40 s dans le passé ou de 20 s dans le futur. La norme l'impose pour empêcher le rejeu d'une trame capturée. Le refus donne l'heure au hub, qui se recale et renvoie son message. Un hub dont l'horloge avance ou retarde (de 2 minutes au plus) est mesuré sur ses messages : après trois mesures concordantes, la fenêtre est centrée sur son heure à lui. |
+| Mal daté | Message chiffré daté de plus de 40 s dans le passé ou de 20 s dans le futur. La norme l'impose pour empêcher le rejeu d'une trame capturée. Le refus donne l'heure au hub, qui se recale et renvoie son message. Un hub dont l'horloge avance ou retarde (de 10 minutes au plus) est mesuré sur ses messages : après trois mesures concordantes, la fenêtre est centrée sur son heure à lui. |
 | CRC faux, Illisible | Trame abîmée ou qui n'est pas du SIA DC-09. Une connexion qui en envoie cinq de suite est fermée. Une longueur annoncée fausse avec un CRC juste est acceptée et signalée par une icône. |
 | Refusé | Adresse absente de la liste des adresses autorisées. |
 | Doublon | Message réémis par le hub. Il reçoit un accusé de réception mais n'est traité qu'une fois. |

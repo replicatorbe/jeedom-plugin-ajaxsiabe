@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.1 — 21/10/2026
+
+- Arrêt propre du démon : il reçoit SIGTERM et dispose de dix secondes avant
+  un kill -9 pour remettre à Jeedom les événements déjà accusés au hub, garder
+  l'horloge des hubs et fermer ses ports ; le redémarrage attend que le port
+  d'ordres et le port SIA soient libérés. Auparavant le kill -9 suivait
+  aussitôt : un événement en attente pouvait se perdre, et le nouveau démon
+  trouver un port encore pris.
+- « Armer » et « Désarmer » sont liées à l'info « Armée », « Mode nuit » à
+  « Mode » : widgets et applications montrent l'état de l'alarme à côté de
+  l'action. Cet état reste celui que confirme le SIA, jamais celui demandé.
+  Le lien est posé sur les hubs existants à leur prochain enregistrement,
+  sauf s'il a été choisi à la main.
+- Horloge du hub : la correction va désormais jusqu'à 10 minutes d'écart (2
+  auparavant). Le hub dérive d'environ 6 s par jour et avait dépassé les 2
+  minutes : ses mesures n'étaient plus prises en compte.
+
 ## 0.4 — 29/09/2026
 
 Une seule alarme dans Jeedom : le hub SIA pilote la centrale par le plugin
